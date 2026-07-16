@@ -1,0 +1,4 @@
+The optional Rust fixed-effect demeaning kernel in this project is adapted from
+igerber/diff-diff (https://github.com/igerber/diff-diff), which is licensed
+under the MIT License. The original copyright and license notice must be
+preserved when distributing the adapted implementation.

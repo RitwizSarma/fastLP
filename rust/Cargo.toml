@@ -1,0 +1,14 @@
+[package]
+name = "fastlp-rust"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "fastlp_rust"
+crate-type = ["cdylib"]
+
+[dependencies]
+numpy = "0.22"
+pyo3 = { version = "0.22", features = ["extension-module"] }
+rayon = "1.10"
