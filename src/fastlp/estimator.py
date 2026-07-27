@@ -1,4 +1,4 @@
-"""Scikit-learn-style balanced-panel local projections estimator."""
+"""Scikit-learn-style cached panel local projections estimator."""
 
 from __future__ import annotations
 
@@ -39,6 +39,7 @@ class LocalProjection:
         alpha: float = 0.05,
         demean_tol: float = 1e-10,
         max_iter: int = 10_000,
+        allow_unbalanced: bool = False,
     ) -> None:
         if not isinstance(horizons, int) or horizons < 0:
             raise ValueError("horizons must be a non-negative integer")
@@ -53,6 +54,7 @@ class LocalProjection:
         self.alpha = alpha
         self.demean_tol = demean_tol
         self.max_iter = max_iter
+        self.allow_unbalanced = allow_unbalanced
 
     def fit(
         self,
@@ -105,6 +107,17 @@ class LocalProjection:
             raise ValueError("data must contain at least one panel unit")
         time_index = panels[0][time].tolist()
         if any(panel[time].tolist() != time_index for panel in panels[1:]):
+            if self.allow_unbalanced:
+                return self._fit_unbalanced(
+                    frame,
+                    outcome=outcome,
+                    shocks=shocks,
+                    controls=controls,
+                    unit=unit,
+                    time=time,
+                    effects=effects,
+                    cluster=cluster,
+                )
             raise ValueError("v0.1 requires every unit to share the same ordered time labels")
         n_periods = len(time_index)
         if n_periods <= self.horizons:
@@ -164,6 +177,153 @@ class LocalProjection:
             "x_iterations": x_diag.iterations,
             "y_iterations": y_diag.iterations,
             "backend": x_diag.backend,
+        }
+        return self
+
+    def _fit_unbalanced(
+        self,
+        frame: pd.DataFrame,
+        *,
+        outcome: str,
+        shocks: tuple[str, ...],
+        controls: tuple[str, ...],
+        unit: str,
+        time: str,
+        effects: tuple[str, ...],
+        cluster: str | None,
+    ) -> "LocalProjection":
+        """Fit each horizon on its valid unit-time lead sample.
+
+        This path is intentionally opt-in because its design changes across
+        horizons. It reuses exact cross-product sufficient statistics where
+        possible. Time labels must be numeric and a lead is valid only when
+        the exact ``time + horizon`` observation exists.
+        """
+        try:
+            numeric_time = pd.to_numeric(frame[time], errors="raise")
+        except (TypeError, ValueError) as error:
+            raise ValueError("allow_unbalanced requires numeric time labels") from error
+        frame = frame.copy()
+        frame[time] = numeric_time
+        # Resolve leads once against the sorted panel index.  In contrast to a
+        # merge per horizon, this leaves us with integer row masks that can also
+        # drive exact cross-product updates when observations enter or leave.
+        panel_index = pd.MultiIndex.from_frame(frame[[unit, time]])
+        unit_values = frame[unit].to_numpy()
+        time_values = frame[time].to_numpy()
+        outcome_values = frame[outcome].to_numpy(dtype=np.float64)
+        base_x = frame.loc[:, list((*shocks, *controls))].to_numpy(dtype=np.float64)
+        if not effects:
+            base_x = np.column_stack((np.ones(len(frame), dtype=np.float64), base_x))
+
+        # Raw X'X is the initial cache. Subsequent no-FE horizons update it by
+        # adding/removing only the changed rows. For one FE, group sums and
+        # counts give the exact within Gram without re-forming X_tilde'X_tilde.
+        raw_gram = base_x.T @ base_x
+        previous_mask = np.ones(len(frame), dtype=bool)
+        effect_codes_full = None
+        effect_count_full = 0
+        if len(effects) == 1:
+            encoded, uniques = pd.factorize(frame[effects[0]], sort=True)
+            effect_codes_full = encoded.astype(np.int64)
+            effect_count_full = len(uniques)
+        feature_names = list((*shocks, *controls))
+        if not effects:
+            feature_names.insert(0, "Intercept")
+        coefficients = []
+        standard_errors = []
+        covariances = []
+        n_obs_by_horizon = []
+        diagnostics = []
+        sample_indices = []
+        cache_modes = []
+
+        for horizon in range(self.horizons + 1):
+            future_positions = panel_index.get_indexer(
+                pd.MultiIndex.from_arrays((unit_values, time_values + horizon))
+            )
+            mask = future_positions >= 0
+            positions = np.flatnonzero(mask)
+            sample = frame.iloc[positions]
+            y = outcome_values[future_positions[mask], None]
+            x = base_x[mask]
+            effect_codes, effect_counts = factorize_effects(sample, effects)
+            x_tilde, x_diag = demean(
+                x, effect_codes, effect_counts, tol=self.demean_tol, max_iter=self.max_iter
+            )
+            y_tilde, y_diag = demean(
+                y, effect_codes, effect_counts, tol=self.demean_tol, max_iter=self.max_iter
+            )
+            changed = mask ^ previous_mask
+            if changed.any():
+                removed = previous_mask & ~mask
+                added = mask & ~previous_mask
+                raw_gram -= base_x[removed].T @ base_x[removed]
+                raw_gram += base_x[added].T @ base_x[added]
+            previous_mask = mask.copy()
+            if not effects:
+                gram = raw_gram.copy()
+                cache_mode = "rank_update"
+            elif len(effects) == 1:
+                selected_codes = effect_codes_full[mask]
+                counts = np.bincount(selected_codes, minlength=effect_count_full)
+                sums = np.empty((effect_count_full, x.shape[1]), dtype=np.float64)
+                for feature in range(x.shape[1]):
+                    sums[:, feature] = np.bincount(
+                        selected_codes, weights=x[:, feature], minlength=effect_count_full
+                    )
+                nonempty = counts > 0
+                gram = raw_gram - (sums[nonempty].T / counts[nonempty]) @ sums[nonempty]
+                cache_mode = "group_sufficient_statistics"
+            else:
+                gram = x_tilde.T @ x_tilde
+                cache_mode = "alternating_projections"
+            gram = (gram + gram.T) / 2
+            rank = int(np.linalg.matrix_rank(x_tilde))
+            if rank != x_tilde.shape[1]:
+                raise ValueError(f"residualized design is rank deficient at horizon {horizon}")
+            if len(sample) <= rank:
+                raise ValueError("residual degrees of freedom must be positive")
+            try:
+                chol = np.linalg.cholesky(gram)
+            except np.linalg.LinAlgError as error:
+                raise ValueError("residualized design is not positive definite") from error
+            bread = np.linalg.solve(chol.T, np.linalg.solve(chol, np.eye(rank)))
+            coef = np.linalg.solve(chol.T, np.linalg.solve(chol, x_tilde.T @ y_tilde))[:, 0]
+            residual = y_tilde[:, 0] - x_tilde @ coef
+            if self.covariance == "hc1":
+                covariance = hc1(x_tilde, residual[:, None], bread)[0]
+            else:
+                cluster_codes, _ = pd.factorize(sample[cluster], sort=True)
+                covariance = cluster_cr1(x_tilde, residual[:, None], cluster_codes.astype(np.int64), bread)[0]
+            stderr = np.sqrt(np.maximum(np.diag(covariance), 0.0))
+            coefficients.append(coef)
+            standard_errors.append(stderr)
+            covariances.append(covariance)
+            n_obs_by_horizon.append(len(sample))
+            diagnostics.append((x_diag.iterations, y_diag.iterations, x_diag.backend))
+            sample_indices.append(sample.index.copy())
+            cache_modes.append(cache_mode)
+
+        z_value = NormalDist().inv_cdf(1 - self.alpha / 2)
+        self.coef_ = np.asarray(coefficients)
+        self.stderr_ = np.asarray(standard_errors)
+        self.covariance_ = np.asarray(covariances)
+        self.conf_int_ = np.stack(
+            (self.coef_ - z_value * self.stderr_, self.coef_ + z_value * self.stderr_), axis=-1
+        )
+        self.horizons_ = np.arange(self.horizons + 1)
+        self.feature_names_in_ = np.asarray(feature_names, dtype=object)
+        self.n_obs_by_horizon_ = np.asarray(n_obs_by_horizon, dtype=int)
+        self.n_obs_ = int(self.n_obs_by_horizon_.max())
+        self.n_units_ = frame[unit].nunique()
+        self.n_periods_ = frame[time].nunique()
+        self.sample_index_by_horizon_ = tuple(sample_indices)
+        self.demeaning_diagnostics_ = {
+            "x_iterations": np.asarray([item[0] for item in diagnostics]),
+            "y_iterations": np.asarray([item[1] for item in diagnostics]),
+            "backend": diagnostics[0][2],
+            "gram_cache_mode": np.asarray(cache_modes, dtype=object),
         }
         return self
 

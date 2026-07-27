@@ -1,6 +1,6 @@
 # fastLP
 
-`fastLP` estimates linear local projections for strictly balanced panel data.
+`fastLP` estimates linear local projections for balanced and unbalanced panel data.
 It uses one common anchor sample across all horizons, residualizes the
 right-hand-side design once, and reuses its factorization for every horizon.
 
@@ -21,8 +21,13 @@ lp.fit(
 print(lp.to_frame())
 ```
 
-v0.1 supports HC1 and one-way cluster-robust covariance. It intentionally
-rejects unbalanced panels, horizon-varying regressors, and HAC inference.
+v0.1 supports HC1 and one-way cluster-robust covariance. Unbalanced panels are
+opt-in with `allow_unbalanced=True`; each horizon uses observations with an
+exact `time + horizon` lead. That path caches the initial raw-design Gram and
+updates it for rows entering or leaving the sample. With one fixed effect it
+uses exact group sufficient statistics; specifications with multiple fixed
+effects safely fall back to alternating-projection demeaning. Horizon-varying
+regressors and HAC inference are not yet supported.
 
 The optional native demeaning backend is built with:
 

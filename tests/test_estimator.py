@@ -64,6 +64,55 @@ def test_rejects_unbalanced_panel() -> None:
         )
 
 
+@pytest.mark.parametrize("fixed_effects", [(), ("unit",), ("unit", "time")])
+def test_unbalanced_matches_separate_horizon_ols(fixed_effects: tuple[str, ...]) -> None:
+    data = balanced_panel()
+    data["shock"] += 0.013 * data["unit"] * data["time"] ** 2
+    data["control"] += 0.017 * data["unit"] ** 2 * data["time"]
+    data = data.query(
+        "not ((unit == 0 and time == 2) or (unit == 1 and time == 6) or (unit == 3 and time == 4))"
+    )
+    fitted = LocalProjection(horizons=2, covariance="hc1", allow_unbalanced=True).fit(
+        data,
+        outcome="y",
+        shock="shock",
+        controls=["control"],
+        unit="unit",
+        time="time",
+        fixed_effects=fixed_effects,
+    )
+
+    indexed_y = data.set_index(["unit", "time"])["y"]
+    expected = []
+    expected_n = []
+    for horizon in range(3):
+        sample = data.copy()
+        keys = pd.MultiIndex.from_arrays((sample.unit, sample.time + horizon))
+        valid = keys.isin(indexed_y.index)
+        sample = sample.loc[valid].copy()
+        sample["lead_y"] = indexed_y.reindex(keys[valid]).to_numpy()
+        x = sample[["shock", "control"]].to_numpy(dtype=float)
+        y = sample["lead_y"].to_numpy(dtype=float)
+        if not fixed_effects:
+            x = np.column_stack((np.ones(len(x)), x))
+        else:
+            from fastlp._demean import demean, factorize_effects
+
+            codes, counts = factorize_effects(sample, fixed_effects)
+            x, _ = demean(x, codes, counts, tol=1e-10, max_iter=10_000)
+            y = demean(y[:, None], codes, counts, tol=1e-10, max_iter=10_000)[0][:, 0]
+        expected.append(np.linalg.lstsq(x, y, rcond=None)[0])
+        expected_n.append(len(sample))
+
+    np.testing.assert_allclose(fitted.coef_, expected, atol=1e-10)
+    np.testing.assert_array_equal(fitted.n_obs_by_horizon_, expected_n)
+    modes = fitted.demeaning_diagnostics_["gram_cache_mode"]
+    expected_mode = {
+        0: "rank_update", 1: "group_sufficient_statistics", 2: "alternating_projections"
+    }[len(fixed_effects)]
+    assert set(modes) == {expected_mode}
+
+
 def test_cluster_covariance_requires_cluster_column() -> None:
     with pytest.raises(ValueError, match="cluster must be supplied"):
         LocalProjection(horizons=1).fit(

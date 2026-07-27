@@ -35,3 +35,12 @@ To run Stata, set `dataset` at the top of `Stata/benchmark_locproj.do`, ensure
 `locproj` is installed, and execute the do-file with `benchmark/Stata` as the
 working directory. It uses `fe` for unit fixed effects, `i.time` for time fixed
 effects, and clusters at the unit level. The timer covers `locproj` only.
+
+To run fastLP, choose a dataset on the command line from the project root:
+
+```bash
+uv run python benchmark/fastLP/benchmark.py small_balanced
+```
+
+The runner accepts all four dataset names. It excludes CSV loading from the
+reported estimation time and prints the final estimates for every horizon.
