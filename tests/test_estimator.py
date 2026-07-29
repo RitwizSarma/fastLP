@@ -34,7 +34,7 @@ def test_cached_no_fe_matches_separate_ols() -> None:
     np.testing.assert_allclose(fitted.coef_, np.asarray(expected), atol=1e-10)
     assert fitted.n_obs_ == 24
     assert list(fitted.to_frame().columns) == [
-        "horizon", "coefficient", "estimate", "std_error", "ci_low", "ci_high"
+        "horizon", "sample", "n_obs", "coefficient", "estimate", "std_error", "ci_low", "ci_high"
     ]
 
 
@@ -56,12 +56,43 @@ def test_fixed_effects_remove_intercept_and_converge() -> None:
     assert fitted.covariance_.shape == (2, 2, 2)
 
 
-def test_rejects_unbalanced_panel() -> None:
+def test_common_sample_accepts_unbalanced_panel_and_reports_shared_rows() -> None:
     data = balanced_panel().query("not (unit == 0 and time == 7)")
-    with pytest.raises(ValueError, match="same ordered time labels"):
-        LocalProjection(horizons=1, covariance="hc1").fit(
-            data, outcome="y", shock="shock", unit="unit", time="time"
-        )
+    fitted = LocalProjection(horizons=1, covariance="hc1").fit(
+        data, outcome="y", shock="shock", unit="unit", time="time"
+    )
+    assert fitted.sample_ == "common"
+    np.testing.assert_array_equal(fitted.n_obs_by_horizon_, [27, 27])
+    assert fitted.cache_group_by_horizon_.tolist() == [0, 0]
+    assert fitted.sample_index_by_horizon_[0].equals(fitted.sample_index_by_horizon_[1])
+
+
+def test_common_sample_matches_separate_ols_on_its_shared_mask() -> None:
+    data = balanced_panel()
+    data["shock"] += 0.013 * data["unit"] * data["time"] ** 2
+    data["control"] += 0.017 * data["unit"] ** 2 * data["time"]
+    data = data.query("not ((unit == 0 and time == 2) or (unit == 1 and time == 6))")
+    fitted = LocalProjection(horizons=2, covariance="hc1").fit(
+        data, outcome="y", shock="shock", controls=["control"], unit="unit", time="time"
+    )
+
+    indexed_y = data.set_index(["unit", "time"])["y"]
+    mask = np.ones(len(data), dtype=bool)
+    for horizon in range(3):
+        keys = pd.MultiIndex.from_arrays((data.unit, data.time + horizon))
+        mask &= keys.isin(indexed_y.index)
+    expected = []
+    for horizon in range(3):
+        sample = data.loc[mask]
+        keys = pd.MultiIndex.from_arrays((sample.unit, sample.time + horizon))
+        y = indexed_y.reindex(keys).to_numpy()
+        x = np.column_stack((np.ones(len(sample)), sample[["shock", "control"]]))
+        expected.append(np.linalg.lstsq(x, y, rcond=None)[0])
+
+    np.testing.assert_allclose(fitted.coef_, expected, atol=1e-10)
+    tidy_samples = fitted.to_frame().loc[:, ["horizon", "sample", "n_obs"]].drop_duplicates()
+    assert tidy_samples["sample"].tolist() == ["common", "common", "common"]
+    assert tidy_samples["n_obs"].tolist() == [mask.sum()] * 3
 
 
 @pytest.mark.parametrize("fixed_effects", [(), ("unit",), ("unit", "time")])
@@ -72,7 +103,7 @@ def test_unbalanced_matches_separate_horizon_ols(fixed_effects: tuple[str, ...])
     data = data.query(
         "not ((unit == 0 and time == 2) or (unit == 1 and time == 6) or (unit == 3 and time == 4))"
     )
-    fitted = LocalProjection(horizons=2, covariance="hc1", allow_unbalanced=True).fit(
+    fitted = LocalProjection(horizons=2, covariance="hc1", sample="per_horizon").fit(
         data,
         outcome="y",
         shock="shock",
@@ -106,11 +137,9 @@ def test_unbalanced_matches_separate_horizon_ols(fixed_effects: tuple[str, ...])
 
     np.testing.assert_allclose(fitted.coef_, expected, atol=1e-10)
     np.testing.assert_array_equal(fitted.n_obs_by_horizon_, expected_n)
-    modes = fitted.demeaning_diagnostics_["gram_cache_mode"]
-    expected_mode = {
-        0: "rank_update", 1: "group_sufficient_statistics", 2: "alternating_projections"
-    }[len(fixed_effects)]
-    assert set(modes) == {expected_mode}
+    assert fitted.sample_ == "per_horizon"
+    assert fitted.demeaning_diagnostics_["cache_mode"] == "mask_grouped"
+    assert fitted.cache_group_by_horizon_.tolist() == [0, 1, 2]
 
 
 def test_cluster_covariance_requires_cluster_column() -> None:
@@ -118,3 +147,198 @@ def test_cluster_covariance_requires_cluster_column() -> None:
         LocalProjection(horizons=1).fit(
             balanced_panel(), outcome="y", shock="shock", unit="unit", time="time"
         )
+
+
+def covariance_panel() -> pd.DataFrame:
+    """Non-collinear panel with categorical cluster dimensions."""
+    rng = np.random.default_rng(9182)
+    rows = []
+    for unit in range(8):
+        for time in range(14):
+            shock = rng.normal()
+            control = rng.normal()
+            rows.append(
+                {
+                    "unit": unit,
+                    "time": time,
+                    "industry": unit % 3,
+                    "region": unit % 2,
+                    "y": 0.7 * shock - 0.2 * control + rng.normal(),
+                    "shock": shock,
+                    "control": control,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+@pytest.mark.parametrize("covariance", ["homoskedastic", "hc0", "hc1", "hc2", "hc3", "hac", "driscoll_kraay"])
+def test_extended_covariances_produce_finite_cached_results(covariance: str) -> None:
+    fitted = LocalProjection(horizons=2, covariance=covariance).fit(
+        covariance_panel(),
+        outcome="y",
+        shock="shock",
+        controls=["control"],
+        unit="unit",
+        time="time",
+    )
+    assert np.isfinite(fitted.stderr_).all()
+    assert fitted.covariance_config_["kind"] == covariance
+    assert len(fitted.covariance_diagnostics_) == 3
+
+
+def test_multiway_and_interaction_clustering_are_explicit() -> None:
+    data = covariance_panel()
+    multiway = LocalProjection(horizons=2, covariance="cluster").fit(
+        data,
+        outcome="y",
+        shock="shock",
+        controls=["control"],
+        unit="unit",
+        time="time",
+        cluster=["unit", "time"],
+    )
+    interaction = LocalProjection(horizons=2, covariance="cluster").fit(
+        data,
+        outcome="y",
+        shock="shock",
+        controls=["control"],
+        unit="unit",
+        time="time",
+        cluster=("industry", "time"),
+    )
+    assert multiway.covariance_config_["cluster_terms"] == ("unit", "time")
+    assert interaction.covariance_config_["cluster_terms"] == ("industry#time",)
+    assert len(multiway.covariance_diagnostics_[0]["components"]) == 3
+    assert np.isfinite(interaction.stderr_).all()
+
+
+def test_cluster_validation_limits_terms_and_rejects_hac_cluster_mix() -> None:
+    data = covariance_panel()
+    with pytest.raises(ValueError, match="at most four"):
+        LocalProjection(horizons=1, covariance="cluster").fit(
+            data,
+            outcome="y",
+            shock="shock",
+            unit="unit",
+            time="time",
+            cluster=["unit", "time", "industry", "region", ("unit", "region")],
+        )
+    with pytest.raises(ValueError, match="only valid"):
+        LocalProjection(horizons=1, covariance="hac").fit(
+            data, outcome="y", shock="shock", unit="unit", time="time", cluster="unit"
+        )
+
+
+def test_rejects_unknown_sample_policy() -> None:
+    with pytest.raises(ValueError, match="sample must be"):
+        LocalProjection(horizons=1, covariance="hc1", sample="largest")
+
+
+def test_fit_generates_nonconsecutive_lags_without_dropping_future_outcomes() -> None:
+    rng = np.random.default_rng(4321)
+    rows = []
+    for unit in range(5):
+        for time in range(10):
+            rows.append(
+                {
+                    "unit": unit,
+                    "time": time,
+                    "y": rng.normal(),
+                    "shock": rng.normal(),
+                    "control": rng.normal(),
+                }
+            )
+    data = pd.DataFrame(rows)
+    fitted = LocalProjection(horizons=2, covariance="hc1").fit(
+        data,
+        outcome="y",
+        shock="shock",
+        controls=["control"],
+        outcome_lags=[1, 3],
+        shock_lags={"shock": [1, 3]},
+        control_lags=[2],
+        unit="unit",
+        time="time",
+    )
+
+    expected = []
+    for horizon in range(3):
+        x_rows = []
+        y_rows = []
+        for _, panel in data.groupby("unit", sort=True):
+            panel = panel.sort_values("time").reset_index(drop=True)
+            for time in range(3, 8):
+                row = panel.iloc[time]
+                x_rows.append(
+                    [
+                        1.0,
+                        row.shock,
+                        row.control,
+                        panel.iloc[time - 1].y,
+                        panel.iloc[time - 3].y,
+                        panel.iloc[time - 1].shock,
+                        panel.iloc[time - 3].shock,
+                        panel.iloc[time - 2].control,
+                    ]
+                )
+                y_rows.append(panel.iloc[time + horizon].y)
+        expected.append(np.linalg.lstsq(np.asarray(x_rows), y_rows, rcond=None)[0])
+
+    np.testing.assert_allclose(fitted.coef_, expected, atol=1e-10)
+    assert list(fitted.feature_names_in_) == [
+        "Intercept",
+        "shock",
+        "control",
+        "y_lag1",
+        "y_lag3",
+        "shock_lag1",
+        "shock_lag3",
+        "control_lag2",
+    ]
+    assert fitted.n_obs_ == 25
+
+
+def test_unbalanced_lagged_design_matches_separate_ols() -> None:
+    rng = np.random.default_rng(9876)
+    data = pd.DataFrame(
+        [
+            {"unit": unit, "time": time, "y": rng.normal(), "shock": rng.normal()}
+            for unit in range(4)
+            for time in range(9)
+            if (unit, time) != (1, 4)
+        ]
+    )
+    fitted = LocalProjection(horizons=2, covariance="hc1", sample="per_horizon").fit(
+        data,
+        outcome="y",
+        shock="shock",
+        outcome_lags=[1, 3],
+        shock_lags=2,
+        unit="unit",
+        time="time",
+    )
+
+    expected = []
+    for horizon in range(3):
+        x_rows = []
+        y_rows = []
+        for _, panel in data.groupby("unit", sort=True):
+            panel = panel.sort_values("time").reset_index(drop=True)
+            indexed_y = panel.set_index("time").y
+            for row_index, row in panel.iterrows():
+                if row_index < 3 or row.time + horizon not in indexed_y.index:
+                    continue
+                x_rows.append(
+                    [
+                        1.0,
+                        row.shock,
+                        panel.iloc[row_index - 1].y,
+                        panel.iloc[row_index - 3].y,
+                        panel.iloc[row_index - 1].shock,
+                        panel.iloc[row_index - 2].shock,
+                    ]
+                )
+                y_rows.append(indexed_y.loc[row.time + horizon])
+        expected.append(np.linalg.lstsq(np.asarray(x_rows), y_rows, rcond=None)[0])
+
+    np.testing.assert_allclose(fitted.coef_, expected, atol=1e-10)

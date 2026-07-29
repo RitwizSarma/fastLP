@@ -1,4 +1,4 @@
-"""Cached local-projection estimation for balanced panel data."""
+"""Cached local-projection estimation for balanced and unbalanced panel data."""
 
 from .estimator import LocalProjection
 

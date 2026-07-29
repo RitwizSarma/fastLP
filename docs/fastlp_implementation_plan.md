@@ -447,8 +447,8 @@ where it intentionally does not; all equivalence tests still pass.
 
 ### M6: Controlled extensions
 
-- Add a grouped-cache implementation for `sample="per_horizon"`, keyed by the
-  exact retained-row mask and validated design/FE/cluster encoding.
+- Maintain the grouped-cache implementation for `sample="per_horizon"`, keyed
+  by the exact retained-row mask and validated design/FE/cluster encoding.
 - Add multi-way clustering, HAC options, weights, formula support, and optional
   Polars input one at a time, each with its own reference tests and benchmark.
 

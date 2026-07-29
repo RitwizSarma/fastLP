@@ -104,7 +104,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--horizons", type=int, help="override a scenario's horizon count")
     parser.add_argument("--repetitions", type=int, default=3, help="measured fits (default: 3)")
     parser.add_argument("--warmups", type=int, default=1, help="unreported warm-up fits (default: 1)")
-    parser.add_argument("--covariance", choices=("cluster", "hc1"), default="cluster")
+    parser.add_argument(
+        "--covariance",
+        choices=("homoskedastic", "hc0", "hc1", "hc2", "hc3", "cluster", "hac", "driscoll_kraay"),
+        default="cluster",
+    )
     parser.add_argument("--fixed-effects", nargs="*", default=["unit", "time"])
     parser.add_argument("--threads", type=int, help="set coordinated Rayon/BLAS thread counts")
     parser.add_argument("--validate", action="store_true", help="compare with independent-horizon reference if balanced")
@@ -156,7 +160,11 @@ def main() -> None:
     )
 
     def fit_once() -> LocalProjection:
-        model = LocalProjection(horizons=horizons, covariance=args.covariance, allow_unbalanced=not balanced)
+        model = LocalProjection(
+            horizons=horizons,
+            covariance=args.covariance,
+            sample="common" if balanced else "per_horizon",
+        )
         return model.fit(data, **fit_options)
 
     with temporary_thread_policy(args.threads):
@@ -175,7 +183,7 @@ def main() -> None:
         reference = None
         agreement: dict[str, Any]
         if args.validate or args.baseline:
-            if balanced:
+            if balanced and args.covariance in {"cluster", "hc1"}:
                 reference_call = lambda: fit_independent_horizons(
                     data, horizons=horizons, covariance=args.covariance, fixed_effects=effects, cluster=cluster, controls=controls
                 )
@@ -187,7 +195,10 @@ def main() -> None:
                 agreement = _agreement(fitted, reference, args.atol, args.rtol)  # type: ignore[arg-type]
             else:
                 baseline = None
-                agreement = {"available": False, "reason": "reference currently supports balanced panels only"}
+                agreement = {
+                    "available": False,
+                    "reason": "reference currently supports only balanced hc1 and one-way cluster covariance",
+                }
         else:
             baseline = None
             agreement = {"available": False, "reason": "pass --validate to run numerical agreement"}
@@ -209,7 +220,13 @@ def main() -> None:
         "source": source,
         "environment": environment,
         "dimensions": _dimensions(data, horizons, effects, controls),
-        "settings": {"covariance": args.covariance, "allow_unbalanced": not balanced, "balanced": balanced, "warmups": args.warmups, "repetitions": args.repetitions},
+        "settings": {
+            "covariance": args.covariance,
+            "sample": "common" if balanced else "per_horizon",
+            "balanced": balanced,
+            "warmups": args.warmups,
+            "repetitions": args.repetitions,
+        },
         "wall_seconds": {"min": min(item.wall_seconds for item in measurements), "median": float(np.median([item.wall_seconds for item in measurements])), "max": max(item.wall_seconds for item in measurements)},
         "agreement": agreement,
     }

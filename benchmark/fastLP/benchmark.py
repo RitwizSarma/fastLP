@@ -35,7 +35,7 @@ def main() -> None:
     estimator = LocalProjection(
         horizons=config["horizons"],
         covariance="cluster",
-        allow_unbalanced=config["unbalanced"],
+        sample="per_horizon" if config["unbalanced"] else "common",
     )
 
     # Keep CSV loading outside the timed region, matching the R benchmark.

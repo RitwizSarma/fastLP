@@ -1,5 +1,84 @@
 # fastLP Next Steps
 
+## Inference: broaden error calculations without narrowing LP specifications
+
+The estimator now provides classical, HC0--HC3, one- through four-way CR0/CR1
+clustered, within-unit Newey--West HAC, and Driscoll--Kraay covariance, all
+with normal critical values. LP users still need a broader inference menu over
+time, because few clusters and nonstandard sampling distributions are common.
+
+Priority additions are:
+
+1. **Bootstrap and leverage-adjusted clustering.** Add CR2/CR3, wild-cluster,
+   and bootstrap procedures for applications with few clusters or nonstandard
+   sampling distributions.
+2. **Combined dependence models.** Define and validate any future
+   cluster-HAC estimator explicitly; the current HAC and Driscoll--Kraay paths
+   intentionally do not combine arbitrary cluster terms.
+3. **Small-sample critical values.** Make the interval distribution explicit:
+   support normal and Student-*t* critical values, use residual degrees of
+   freedom for non-clustered estimates, and provide a cluster-based degrees-of-
+   freedom convention for clustered estimates. Record the chosen critical value,
+   degrees of freedom, and correction in result metadata.
+
+All covariance choices should be available independently of the sample policy.
+They may use different cache paths internally, but selecting HAC, multiway
+clustering, or a small-sample critical value must never change the requested LP
+regressors, lags, fixed effects, or horizon sample without reporting it.
+
+### Cumulative responses are not multipliers
+
+When fastLP gains cumulative or IV specifications, expose the estimand
+explicitly rather than using one ambiguous boolean:
+
+- **Level response:** regress \(y_{t+h}\) on the contemporaneous shock.
+- **Cumulative response:** regress \(\sum_{j=0}^{h} y_{t+j}\) on the
+  contemporaneous shock. This is a cumulative impulse response, not a fiscal
+  or integral multiplier.
+- **Integral multiplier:** regress cumulative outcome on cumulative impulse;
+  with an endogenous impulse, estimate this as one LP-IV regression. Its
+  reported standard error must be for that coefficient itself, not a ratio of
+  separately estimated IRFs or a cumulative sum of level-response standard
+  errors.
+
+Use named modes (for example, `cumulation="none"`, `"outcome"`, and
+`"both"`) and separate result labels. For LP-IV, return a horizon-specific
+weak-instrument diagnostic with the result. This makes a common substantive
+mistake—calling a cumulative response a multiplier—hard to express in the API.
+
+### Validation additions
+
+Add an external-reference and statistical-validation layer alongside the
+existing slow-equivalence tests:
+
+1. Create versioned golden fixtures from independent implementations:
+   statsmodels for OLS/HAC LPs and linearmodels for LP-IV. Pin point estimates,
+   standard errors, effective sample sizes, covariance settings, and bandwidth
+   conventions with documented numerical tolerances.
+2. Add deterministic Monte Carlo property tests for coverage, especially under
+   persistent and near-unit-root data-generating processes. Compare the
+   coverage of any lag-augmented HC1 option with HAC rather than validating
+   only point estimates.
+3. Test cumulative estimands directly: cumulative-response point estimates may
+   approximately track sums of level IRFs, but their standard errors must come
+   from the cumulative regression. Test multiplier identities using the
+   one-step estimator, including weak-instrument warnings.
+4. Keep the fastLP-specific reference suite for fixed effects, clustering,
+   unbalanced panels, and common versus per-horizon samples; tsecon's
+   single-series tests do not cover those cases.
+
+### Provenance
+
+These additions were prompted by a review of the vendored
+[`others/tsecon`](../others/tsecon) Rust implementation, especially
+`crates/tsecon-lp/src/spec.rs`, `level.rs`, and its golden/property tests.
+Its API distinguishes cumulative IRFs from integral multipliers, and its test
+fixtures compare HAC OLS to statsmodels and LP-IV to linearmodels. The
+lag-augmented inference idea follows Montiel Olea and Plagborg-Møller (2021);
+the cumulative-multiplier distinction follows Ramey and Zubairy (2018). These
+are ideas to adapt to fastLP's panel setting, not a proposal to replace the
+shared-design panel engine with tsecon's per-horizon single-series engine.
+
 ## Current Assessment
 
 The v0.1 algorithm has the correct high-level optimization for the balanced,

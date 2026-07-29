@@ -1,7 +1,7 @@
 [project]
 name = "fastlp"
 version = "0.1.0"
-description = "Fast local projections for balanced panel data"
+description = "Fast local projections for balanced and unbalanced panel data"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

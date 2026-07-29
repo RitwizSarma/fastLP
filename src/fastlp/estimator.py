@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from numbers import Integral
 from statistics import NormalDist
 
 import numpy as np
 import pandas as pd
 
-from ._covariance import cluster_cr1, hc1
+from ._covariance import (
+    Kernel,
+    cluster as cluster_covariance,
+    factorize_cluster_terms,
+    hac,
+    hc,
+    homoskedastic,
+)
 from ._demean import demean, factorize_effects
 
 
@@ -23,12 +31,115 @@ def _as_columns(value: str | Sequence[str] | None, name: str) -> tuple[str, ...]
     return columns
 
 
-class LocalProjection:
-    """Fast local projections for a strictly balanced panel.
+ClusterTerm = str | tuple[str, ...]
 
-    Every horizon uses the common anchor periods ``0..T-horizons``. This is
-    intentional: it guarantees that the transformed RHS is identical at every
-    horizon and can be cached safely.
+
+def _as_cluster_terms(value: ClusterTerm | Sequence[ClusterTerm] | None) -> tuple[tuple[str, ...], ...]:
+    """Normalize cluster terms; a bare tuple denotes one interaction term."""
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        raw_terms: Sequence[ClusterTerm] = (value,)
+    elif isinstance(value, tuple) and all(isinstance(column, str) for column in value):
+        raw_terms = (value,)
+    else:
+        if isinstance(value, (str, bytes)):
+            raise ValueError("cluster must be a column, an interaction tuple, or a sequence of terms")
+        try:
+            raw_terms = tuple(value)
+        except TypeError as error:
+            raise ValueError("cluster must be a column, an interaction tuple, or a sequence of terms") from error
+
+    terms: list[tuple[str, ...]] = []
+    for item in raw_terms:
+        if isinstance(item, str):
+            term = (item,)
+        elif isinstance(item, tuple) and item and all(isinstance(column, str) for column in item):
+            if len(set(item)) != len(item):
+                raise ValueError("a cluster interaction must not repeat a column")
+            term = tuple(sorted(item))
+        else:
+            raise ValueError("cluster terms must be column names or non-empty tuples of column names")
+        terms.append(term)
+    if not terms:
+        raise ValueError("cluster must contain at least one term")
+    if len(terms) > 4:
+        raise ValueError("cluster supports at most four terms because multiway covariance is exponential")
+    if len(set(terms)) != len(terms):
+        raise ValueError("cluster must not contain duplicate terms")
+    return tuple(terms)
+
+
+def _as_lag_numbers(value: int | Sequence[int], name: str) -> tuple[int, ...]:
+    """Normalize a lag count or an explicit positive lag grid."""
+    if isinstance(value, Integral) and not isinstance(value, bool):
+        if value < 0:
+            raise ValueError(f"{name} must be non-negative")
+        return tuple(range(1, int(value) + 1))
+    if isinstance(value, str):
+        raise ValueError(f"{name} must be an integer or a sequence of positive integers")
+    try:
+        lags = tuple(value)
+    except TypeError as error:
+        raise ValueError(f"{name} must be an integer or a sequence of positive integers") from error
+    if any(not isinstance(lag, Integral) or isinstance(lag, bool) or lag < 1 for lag in lags):
+        raise ValueError(f"{name} must contain only positive integers")
+    if len(set(lags)) != len(lags):
+        raise ValueError(f"{name} must not contain duplicate lags")
+    return tuple(int(lag) for lag in lags)
+
+
+def _lag_requests(
+    value: int | Sequence[int] | Mapping[str, int | Sequence[int]],
+    columns: tuple[str, ...],
+    name: str,
+) -> tuple[tuple[str, int], ...]:
+    """Expand one lag specification into ordered ``(source, lag)`` pairs."""
+    if isinstance(value, Mapping):
+        unknown = sorted(set(value).difference(columns))
+        if unknown:
+            raise ValueError(f"{name} contains columns not in this specification: {unknown}")
+        requests = [
+            (column, lag)
+            for column in columns
+            for lag in _as_lag_numbers(value.get(column, ()), f"{name}[{column!r}]")
+        ]
+    else:
+        lags = _as_lag_numbers(value, name)
+        requests = [(column, lag) for column in columns for lag in lags]
+    return tuple(requests)
+
+
+def _add_lags(
+    frame: pd.DataFrame, unit: str, requests: Sequence[tuple[str, int]]
+) -> tuple[pd.DataFrame, tuple[str, ...], np.ndarray]:
+    """Generate within-unit row lags and identify rows valid as LP anchors."""
+    output = frame.copy()
+    feature_names: list[str] = []
+    seen: set[tuple[str, int]] = set()
+    for source, lag in requests:
+        key = (source, lag)
+        if key in seen:
+            continue
+        seen.add(key)
+        feature = f"{source}_lag{lag}"
+        if feature in output.columns:
+            raise ValueError(f"generated lag feature {feature!r} conflicts with a supplied model column")
+        output[feature] = output.groupby(unit, sort=False, observed=True)[source].shift(lag)
+        feature_names.append(feature)
+    if not feature_names:
+        return output, (), np.ones(len(output), dtype=bool)
+    valid = output.loc[:, feature_names].notna().all(axis=1).to_numpy()
+    return output, tuple(feature_names), valid
+
+
+class LocalProjection:
+    """Fast local projections with an explicit horizon-sample policy.
+
+    ``sample="common"`` uses one anchor sample at every horizon, so the
+    residualized RHS and its factorization are shared. ``sample="per_horizon"``
+    retains every valid anchor at each horizon and shares a cache only among
+    horizons with an identical retained-row mask.
     """
 
     def __init__(
@@ -36,25 +147,53 @@ class LocalProjection:
         *,
         horizons: int,
         covariance: str = "cluster",
+        hac_lags: int | None = None,
+        hac_kernel: Kernel = "bartlett",
+        hac_debias: bool = True,
+        cluster_correction: str = "cr1",
         alpha: float = 0.05,
         demean_tol: float = 1e-10,
         max_iter: int = 10_000,
-        allow_unbalanced: bool = False,
+        sample: str = "common",
     ) -> None:
         if not isinstance(horizons, int) or horizons < 0:
             raise ValueError("horizons must be a non-negative integer")
-        if covariance not in {"hc1", "cluster"}:
-            raise ValueError("covariance must be 'hc1' or 'cluster'")
+        allowed_covariance = {
+            "homoskedastic",
+            "hc0",
+            "hc1",
+            "hc2",
+            "hc3",
+            "cluster",
+            "hac",
+            "driscoll_kraay",
+        }
+        if covariance not in allowed_covariance:
+            raise ValueError(f"covariance must be one of {sorted(allowed_covariance)}")
+        if hac_lags is not None and (not isinstance(hac_lags, int) or hac_lags < 0):
+            raise ValueError("hac_lags must be a non-negative integer or None")
+        if hac_kernel not in {"bartlett", "parzen", "quadratic_spectral"}:
+            raise ValueError("hac_kernel must be 'bartlett', 'parzen', or 'quadratic_spectral'")
+        if not isinstance(hac_debias, bool):
+            raise ValueError("hac_debias must be a boolean")
+        if cluster_correction not in {"cr0", "cr1"}:
+            raise ValueError("cluster_correction must be 'cr0' or 'cr1'")
         if not 0 < alpha < 1:
             raise ValueError("alpha must be between zero and one")
         if demean_tol <= 0 or max_iter < 1:
             raise ValueError("demean_tol must be positive and max_iter must be at least one")
+        if sample not in {"common", "per_horizon"}:
+            raise ValueError("sample must be 'common' or 'per_horizon'")
         self.horizons = horizons
         self.covariance = covariance
+        self.hac_lags = hac_lags
+        self.hac_kernel = hac_kernel
+        self.hac_debias = hac_debias
+        self.cluster_correction = cluster_correction
         self.alpha = alpha
         self.demean_tol = demean_tol
         self.max_iter = max_iter
-        self.allow_unbalanced = allow_unbalanced
+        self.sample = sample
 
     def fit(
         self,
@@ -63,12 +202,23 @@ class LocalProjection:
         outcome: str,
         shock: str | Sequence[str],
         controls: Sequence[str] = (),
+        outcome_lags: int | Sequence[int] = 0,
+        shock_lags: int | Sequence[int] | Mapping[str, int | Sequence[int]] = 0,
+        control_lags: int | Sequence[int] | Mapping[str, int | Sequence[int]] = 0,
         unit: str,
         time: str,
         fixed_effects: Sequence[str] = (),
-        cluster: str | None = None,
+        cluster: ClusterTerm | Sequence[ClusterTerm] | None = None,
     ) -> "LocalProjection":
-        """Fit local projections and cache all shared-design calculations."""
+        """Fit local projections according to the configured sample policy.
+
+        A scalar lag setting includes all lags from one through that value;
+        sequences select an arbitrary positive lag grid.  For shocks and
+        controls, a mapping can assign a separate setting to each column.
+        Lags are generated automatically from preceding, sorted observations
+        within each unit. Rows without every requested lag are not used as LP
+        anchors, but remain available as future outcomes.
+        """
         if not isinstance(data, pd.DataFrame):
             raise TypeError("data must be a pandas DataFrame")
         shocks = _as_columns(shock, "shock")
@@ -76,16 +226,25 @@ class LocalProjection:
             raise ValueError("shock must be a column name or a non-empty sequence of column names")
         controls = _as_columns(controls, "controls")
         effects = _as_columns(fixed_effects, "fixed_effects")
+        cluster_terms = _as_cluster_terms(cluster) if cluster is not None else ()
         required = (outcome, unit, time, *shocks, *controls, *effects)
         if self.covariance == "cluster":
-            if cluster is None:
+            if not cluster_terms:
                 raise ValueError("cluster must be supplied when covariance='cluster'")
-            required = (*required, cluster)
+            required = (*required, *(column for term in cluster_terms for column in term))
+        elif cluster_terms:
+            raise ValueError("cluster is only valid when covariance='cluster'")
         missing = sorted(set(required).difference(data.columns))
         if missing:
             raise ValueError(f"data is missing required columns: {missing}")
         if len(set((*shocks, *controls))) != len((*shocks, *controls)):
             raise ValueError("shock and controls must not contain duplicate columns")
+
+        lag_requests = (
+            *_lag_requests(outcome_lags, (outcome,), "outcome_lags"),
+            *_lag_requests(shock_lags, shocks, "shock_lags"),
+            *_lag_requests(control_lags, controls, "control_lags"),
+        )
 
         frame = data.loc[:, list(dict.fromkeys(required))].copy()
         if frame.isna().any().any():
@@ -102,230 +261,202 @@ class LocalProjection:
             raise ValueError("unit and time must uniquely identify panel observations")
 
         frame = frame.sort_values([unit, time], kind="stable")
-        panels = [group for _, group in frame.groupby(unit, sort=True, observed=True)]
-        if len(panels) < 1:
+        frame, lag_feature_names, valid_lag_rows = _add_lags(frame, unit, lag_requests)
+        if frame.empty:
             raise ValueError("data must contain at least one panel unit")
-        time_index = panels[0][time].tolist()
-        if any(panel[time].tolist() != time_index for panel in panels[1:]):
-            if self.allow_unbalanced:
-                return self._fit_unbalanced(
-                    frame,
-                    outcome=outcome,
-                    shocks=shocks,
-                    controls=controls,
-                    unit=unit,
-                    time=time,
-                    effects=effects,
-                    cluster=cluster,
-                )
-            raise ValueError("v0.1 requires every unit to share the same ordered time labels")
-        n_periods = len(time_index)
-        if n_periods <= self.horizons:
-            raise ValueError("each unit must have more periods than horizons")
+        future_positions = self._lead_positions(frame, unit=unit, time=time)
+        masks = valid_lag_rows[:, None] & (future_positions >= 0)
+        if self.sample == "common":
+            masks = np.repeat(masks.all(axis=1, keepdims=True), self.horizons + 1, axis=1)
 
-        n_anchor = n_periods - self.horizons
-        anchor = pd.concat([panel.iloc[:n_anchor] for panel in panels], ignore_index=False)
-        y = np.column_stack(
-            [np.concatenate([panel[outcome].to_numpy()[h : h + n_anchor] for panel in panels]) for h in range(self.horizons + 1)]
-        )
-        x_parts = [anchor.loc[:, list((*shocks, *controls))].to_numpy(dtype=np.float64)]
-        feature_names = list((*shocks, *controls))
-        if not effects:
-            x_parts.insert(0, np.ones((len(anchor), 1), dtype=np.float64))
-            feature_names.insert(0, "Intercept")
-        x = np.column_stack(x_parts)
-
-        effect_codes, effect_counts = factorize_effects(anchor, effects)
-        x_tilde, x_diag = demean(x, effect_codes, effect_counts, tol=self.demean_tol, max_iter=self.max_iter)
-        y_tilde, y_diag = demean(y, effect_codes, effect_counts, tol=self.demean_tol, max_iter=self.max_iter)
-        gram = x_tilde.T @ x_tilde
-        rank = int(np.linalg.matrix_rank(x_tilde))
-        if rank != x_tilde.shape[1]:
-            raise ValueError("residualized design is rank deficient")
-        if len(anchor) <= rank:
-            raise ValueError("residual degrees of freedom must be positive")
-        try:
-            chol = np.linalg.cholesky(gram)
-        except np.linalg.LinAlgError as error:
-            raise ValueError("residualized design is not positive definite") from error
-        rhs = x_tilde.T @ y_tilde
-        coef = np.linalg.solve(chol.T, np.linalg.solve(chol, rhs))
-        residuals = y_tilde - x_tilde @ coef
-        bread = np.linalg.solve(chol.T, np.linalg.solve(chol, np.eye(rank)))
-        if self.covariance == "hc1":
-            covariance = hc1(x_tilde, residuals, bread)
-        else:
-            cluster_codes, _ = pd.factorize(anchor[cluster], sort=True)
-            covariance = cluster_cr1(x_tilde, residuals, cluster_codes.astype(np.int64), bread)
-        covariance = (covariance + covariance.transpose(0, 2, 1)) / 2
-        stderr = np.sqrt(np.maximum(np.diagonal(covariance, axis1=1, axis2=2), 0.0))
-        z_value = NormalDist().inv_cdf(1 - self.alpha / 2)
-        interval = np.stack((coef.T - z_value * stderr, coef.T + z_value * stderr), axis=-1)
-
-        self.coef_ = coef.T
-        self.stderr_ = stderr
-        self.covariance_ = covariance
-        self.conf_int_ = interval
-        self.horizons_ = np.arange(self.horizons + 1)
-        self.feature_names_in_ = np.asarray(feature_names, dtype=object)
-        self.n_obs_ = len(anchor)
-        self.n_units_ = len(panels)
-        self.n_periods_ = n_periods
-        self.sample_index_ = anchor.index.copy()
-        self.residuals_ = residuals
-        self.demeaning_diagnostics_ = {
-            "x_iterations": x_diag.iterations,
-            "y_iterations": y_diag.iterations,
-            "backend": x_diag.backend,
-        }
-        return self
-
-    def _fit_unbalanced(
-        self,
-        frame: pd.DataFrame,
-        *,
-        outcome: str,
-        shocks: tuple[str, ...],
-        controls: tuple[str, ...],
-        unit: str,
-        time: str,
-        effects: tuple[str, ...],
-        cluster: str | None,
-    ) -> "LocalProjection":
-        """Fit each horizon on its valid unit-time lead sample.
-
-        This path is intentionally opt-in because its design changes across
-        horizons. It reuses exact cross-product sufficient statistics where
-        possible. Time labels must be numeric and a lead is valid only when
-        the exact ``time + horizon`` observation exists.
-        """
-        try:
-            numeric_time = pd.to_numeric(frame[time], errors="raise")
-        except (TypeError, ValueError) as error:
-            raise ValueError("allow_unbalanced requires numeric time labels") from error
-        frame = frame.copy()
-        frame[time] = numeric_time
-        # Resolve leads once against the sorted panel index.  In contrast to a
-        # merge per horizon, this leaves us with integer row masks that can also
-        # drive exact cross-product updates when observations enter or leave.
-        panel_index = pd.MultiIndex.from_frame(frame[[unit, time]])
-        unit_values = frame[unit].to_numpy()
-        time_values = frame[time].to_numpy()
-        outcome_values = frame[outcome].to_numpy(dtype=np.float64)
-        base_x = frame.loc[:, list((*shocks, *controls))].to_numpy(dtype=np.float64)
+        base_features = (*shocks, *controls, *lag_feature_names)
+        base_x = frame.loc[:, list(base_features)].to_numpy(dtype=np.float64)
         if not effects:
             base_x = np.column_stack((np.ones(len(frame), dtype=np.float64), base_x))
-
-        # Raw X'X is the initial cache. Subsequent no-FE horizons update it by
-        # adding/removing only the changed rows. For one FE, group sums and
-        # counts give the exact within Gram without re-forming X_tilde'X_tilde.
-        raw_gram = base_x.T @ base_x
-        previous_mask = np.ones(len(frame), dtype=bool)
-        effect_codes_full = None
-        effect_count_full = 0
-        if len(effects) == 1:
-            encoded, uniques = pd.factorize(frame[effects[0]], sort=True)
-            effect_codes_full = encoded.astype(np.int64)
-            effect_count_full = len(uniques)
-        feature_names = list((*shocks, *controls))
-        if not effects:
-            feature_names.insert(0, "Intercept")
-        coefficients = []
-        standard_errors = []
-        covariances = []
-        n_obs_by_horizon = []
-        diagnostics = []
-        sample_indices = []
-        cache_modes = []
-
+        feature_names = ("Intercept", *base_features) if not effects else base_features
+        outcome_values = frame[outcome].to_numpy(dtype=np.float64)
+        groups: dict[bytes, list[int]] = {}
+        group_masks: list[np.ndarray] = []
         for horizon in range(self.horizons + 1):
-            future_positions = panel_index.get_indexer(
-                pd.MultiIndex.from_arrays((unit_values, time_values + horizon))
-            )
-            mask = future_positions >= 0
+            mask = masks[:, horizon]
+            key = np.packbits(mask).tobytes()
+            if key not in groups:
+                groups[key] = []
+                group_masks.append(mask)
+            groups[key].append(horizon)
+
+        n_features = base_x.shape[1]
+        n_horizons = self.horizons + 1
+        coefficients = np.empty((n_horizons, n_features), dtype=np.float64)
+        standard_errors = np.empty_like(coefficients)
+        covariances = np.empty((n_horizons, n_features, n_features), dtype=np.float64)
+        residuals_by_horizon: list[np.ndarray | None] = [None] * n_horizons
+        covariance_diagnostics_by_horizon: list[dict[str, object] | None] = [None] * n_horizons
+        y_iterations = np.empty(n_horizons, dtype=int)
+        cache_group_by_horizon = np.empty(n_horizons, dtype=int)
+        x_iterations_by_group: list[np.ndarray] = []
+        backends: list[str] = []
+
+        for group_id, (mask, horizons) in enumerate(zip(group_masks, groups.values(), strict=True)):
+            if not mask.any():
+                raise ValueError(f"no valid observations at horizon {horizons[0]}")
             positions = np.flatnonzero(mask)
-            sample = frame.iloc[positions]
-            y = outcome_values[future_positions[mask], None]
+            anchor = frame.iloc[positions]
             x = base_x[mask]
-            effect_codes, effect_counts = factorize_effects(sample, effects)
+            y = np.column_stack(
+                [outcome_values[future_positions[mask, horizon]] for horizon in horizons]
+            )
+            effect_codes, effect_counts = factorize_effects(anchor, effects)
             x_tilde, x_diag = demean(
                 x, effect_codes, effect_counts, tol=self.demean_tol, max_iter=self.max_iter
             )
             y_tilde, y_diag = demean(
                 y, effect_codes, effect_counts, tol=self.demean_tol, max_iter=self.max_iter
             )
-            changed = mask ^ previous_mask
-            if changed.any():
-                removed = previous_mask & ~mask
-                added = mask & ~previous_mask
-                raw_gram -= base_x[removed].T @ base_x[removed]
-                raw_gram += base_x[added].T @ base_x[added]
-            previous_mask = mask.copy()
-            if not effects:
-                gram = raw_gram.copy()
-                cache_mode = "rank_update"
-            elif len(effects) == 1:
-                selected_codes = effect_codes_full[mask]
-                counts = np.bincount(selected_codes, minlength=effect_count_full)
-                sums = np.empty((effect_count_full, x.shape[1]), dtype=np.float64)
-                for feature in range(x.shape[1]):
-                    sums[:, feature] = np.bincount(
-                        selected_codes, weights=x[:, feature], minlength=effect_count_full
-                    )
-                nonempty = counts > 0
-                gram = raw_gram - (sums[nonempty].T / counts[nonempty]) @ sums[nonempty]
-                cache_mode = "group_sufficient_statistics"
-            else:
-                gram = x_tilde.T @ x_tilde
-                cache_mode = "alternating_projections"
+            gram = (x_tilde.T @ x_tilde)
             gram = (gram + gram.T) / 2
             rank = int(np.linalg.matrix_rank(x_tilde))
             if rank != x_tilde.shape[1]:
-                raise ValueError(f"residualized design is rank deficient at horizon {horizon}")
-            if len(sample) <= rank:
+                raise ValueError(f"residualized design is rank deficient at horizon {horizons[0]}")
+            if len(anchor) <= rank:
                 raise ValueError("residual degrees of freedom must be positive")
             try:
                 chol = np.linalg.cholesky(gram)
             except np.linalg.LinAlgError as error:
                 raise ValueError("residualized design is not positive definite") from error
             bread = np.linalg.solve(chol.T, np.linalg.solve(chol, np.eye(rank)))
-            coef = np.linalg.solve(chol.T, np.linalg.solve(chol, x_tilde.T @ y_tilde))[:, 0]
-            residual = y_tilde[:, 0] - x_tilde @ coef
-            if self.covariance == "hc1":
-                covariance = hc1(x_tilde, residual[:, None], bread)[0]
+            coef = np.linalg.solve(chol.T, np.linalg.solve(chol, x_tilde.T @ y_tilde))
+            residuals = y_tilde - x_tilde @ coef
+            if self.covariance == "homoskedastic":
+                covariance = homoskedastic(x_tilde, residuals, bread)
+                covariance_diagnostics = tuple({"kind": "homoskedastic"} for _ in horizons)
+            elif self.covariance in {"hc0", "hc1", "hc2", "hc3"}:
+                covariance = hc(x_tilde, residuals, bread, self.covariance)
+                covariance_diagnostics = tuple({"kind": self.covariance} for _ in horizons)
+            elif self.covariance == "cluster":
+                cluster_codes, labels = factorize_cluster_terms(anchor, cluster_terms)
+                covariance, cluster_diagnostics = cluster_covariance(
+                    x_tilde,
+                    residuals,
+                    cluster_codes,
+                    labels,
+                    bread,
+                    self.cluster_correction,
+                )
+                covariance_diagnostics = tuple(
+                    {
+                        "kind": "cluster",
+                        "correction": self.cluster_correction,
+                        "components": cluster_diagnostics,
+                    }
+                    for _ in horizons
+                )
             else:
-                cluster_codes, _ = pd.factorize(sample[cluster], sort=True)
-                covariance = cluster_cr1(x_tilde, residual[:, None], cluster_codes.astype(np.int64), bread)[0]
-            stderr = np.sqrt(np.maximum(np.diag(covariance), 0.0))
-            coefficients.append(coef)
-            standard_errors.append(stderr)
-            covariances.append(covariance)
-            n_obs_by_horizon.append(len(sample))
-            diagnostics.append((x_diag.iterations, y_diag.iterations, x_diag.backend))
-            sample_indices.append(sample.index.copy())
-            cache_modes.append(cache_mode)
+                covariance, covariance_diagnostics = hac(
+                    x_tilde,
+                    residuals,
+                    anchor[unit],
+                    anchor[time],
+                    horizons,
+                    bread,
+                    max_lags=self.hac_lags,
+                    kernel=self.hac_kernel,
+                    debias=self.hac_debias,
+                    driscoll_kraay=self.covariance == "driscoll_kraay",
+                )
+            covariance = (covariance + covariance.transpose(0, 2, 1)) / 2
+            diagonal = np.diagonal(covariance, axis1=1, axis2=2)
+            scale = np.maximum(np.max(np.abs(covariance), axis=(1, 2)), 1.0)
+            materially_negative = diagonal < -np.finfo(float).eps * scale[:, None] * 100
+            if materially_negative.any():
+                horizon, feature = np.argwhere(materially_negative)[0]
+                raise ValueError(
+                    f"{self.covariance} covariance has a negative variance at horizon "
+                    f"{horizons[int(horizon)]}, feature {int(feature)}"
+                )
+            stderr = np.sqrt(np.maximum(diagonal, 0.0))
+            coefficients[horizons] = coef.T
+            standard_errors[horizons] = stderr
+            covariances[horizons] = covariance
+            for column, horizon in enumerate(horizons):
+                residuals_by_horizon[horizon] = residuals[:, column]
+                y_iterations[horizon] = y_diag.iterations[column]
+                cache_group_by_horizon[horizon] = group_id
+                covariance_diagnostics_by_horizon[horizon] = covariance_diagnostics[column]
+            x_iterations_by_group.append(x_diag.iterations)
+            backends.append(x_diag.backend)
 
         z_value = NormalDist().inv_cdf(1 - self.alpha / 2)
-        self.coef_ = np.asarray(coefficients)
-        self.stderr_ = np.asarray(standard_errors)
-        self.covariance_ = np.asarray(covariances)
+        sample_indices = tuple(frame.index[mask].copy() for mask in masks.T)
+        self.coef_ = coefficients
+        self.stderr_ = standard_errors
+        self.covariance_ = covariances
         self.conf_int_ = np.stack(
-            (self.coef_ - z_value * self.stderr_, self.coef_ + z_value * self.stderr_), axis=-1
+            (coefficients - z_value * standard_errors, coefficients + z_value * standard_errors), axis=-1
         )
-        self.horizons_ = np.arange(self.horizons + 1)
+        self.horizons_ = np.arange(n_horizons)
         self.feature_names_in_ = np.asarray(feature_names, dtype=object)
-        self.n_obs_by_horizon_ = np.asarray(n_obs_by_horizon, dtype=int)
+        self.sample_ = self.sample
+        self.n_obs_by_horizon_ = masks.sum(axis=0, dtype=int)
         self.n_obs_ = int(self.n_obs_by_horizon_.max())
         self.n_units_ = frame[unit].nunique()
         self.n_periods_ = frame[time].nunique()
-        self.sample_index_by_horizon_ = tuple(sample_indices)
+        self.sample_index_by_horizon_ = sample_indices
+        self.sample_index_ = sample_indices[0]
+        self.residuals_ = (
+            np.column_stack(residuals_by_horizon)
+            if self.sample == "common"
+            else tuple(residuals_by_horizon)
+        )
+        self.cache_group_by_horizon_ = cache_group_by_horizon
+        self.covariance_config_ = {
+            "kind": self.covariance,
+            "cluster_terms": tuple("#".join(term) for term in cluster_terms),
+            "cluster_correction": self.cluster_correction if self.covariance == "cluster" else None,
+            "hac_lags": self.hac_lags if self.covariance in {"hac", "driscoll_kraay"} else None,
+            "hac_kernel": self.hac_kernel if self.covariance in {"hac", "driscoll_kraay"} else None,
+            "hac_debias": self.hac_debias if self.covariance in {"hac", "driscoll_kraay"} else None,
+        }
+        self.covariance_diagnostics_ = tuple(covariance_diagnostics_by_horizon)
         self.demeaning_diagnostics_ = {
-            "x_iterations": np.asarray([item[0] for item in diagnostics]),
-            "y_iterations": np.asarray([item[1] for item in diagnostics]),
-            "backend": diagnostics[0][2],
-            "gram_cache_mode": np.asarray(cache_modes, dtype=object),
+            "x_iterations": x_iterations_by_group[0]
+            if len(x_iterations_by_group) == 1
+            else tuple(x_iterations_by_group),
+            "x_iterations_by_cache_group": tuple(x_iterations_by_group),
+            "y_iterations": y_iterations,
+            "backend": backends[0],
+            "cache_mode": "shared_design" if len(group_masks) == 1 else "mask_grouped",
         }
         return self
+
+    def _lead_positions(self, frame: pd.DataFrame, *, unit: str, time: str) -> np.ndarray:
+        """Resolve exact ``time + horizon`` outcome rows for every anchor."""
+        try:
+            numeric_time = pd.to_numeric(frame[time], errors="raise").to_numpy()
+        except (TypeError, ValueError):
+            panels = [group for _, group in frame.groupby(unit, sort=True, observed=True)]
+            time_index = panels[0][time].tolist()
+            if any(panel[time].tolist() != time_index for panel in panels[1:]):
+                raise ValueError(
+                    "unbalanced panels require numeric time labels for exact time + horizon alignment"
+                ) from None
+            positions = np.full((len(frame), self.horizons + 1), -1, dtype=int)
+            for panel_positions in frame.groupby(unit, sort=True, observed=True).indices.values():
+                panel_positions = np.asarray(panel_positions)
+                for horizon in range(self.horizons + 1):
+                    n_valid = len(panel_positions) - horizon
+                    if n_valid > 0:
+                        positions[panel_positions[:n_valid], horizon] = panel_positions[horizon:]
+            return positions
+
+        panel_index = pd.MultiIndex.from_frame(frame[[unit, time]])
+        units = frame[unit].to_numpy()
+        positions = np.empty((len(frame), self.horizons + 1), dtype=int)
+        for horizon in range(self.horizons + 1):
+            positions[:, horizon] = panel_index.get_indexer(
+                pd.MultiIndex.from_arrays((units, numeric_time + horizon))
+            )
+        return positions
 
     def to_frame(self) -> pd.DataFrame:
         """Return coefficient paths in tidy long form."""
@@ -336,6 +467,8 @@ class LocalProjection:
                 records.append(
                     {
                         "horizon": horizon,
+                        "sample": self.sample_,
+                        "n_obs": self.n_obs_by_horizon_[h_index],
                         "coefficient": feature,
                         "estimate": self.coef_[h_index, feature_index],
                         "std_error": self.stderr_[h_index, feature_index],
@@ -349,7 +482,7 @@ class LocalProjection:
         """Return a compact textual summary."""
         self._require_fitted()
         return (
-            f"LocalProjection(horizons=0..{self.horizons}, n_obs={self.n_obs_}, "
+            f"LocalProjection(horizons=0..{self.horizons}, sample={self.sample_!r}, n_obs={self.n_obs_}, "
             f"covariance={self.covariance}, backend={self.demeaning_diagnostics_['backend']})"
         )
 

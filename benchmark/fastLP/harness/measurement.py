@@ -80,8 +80,10 @@ class _StageHooks:
 
         self._wrap(estimator, "factorize_effects", "fe_encoding")
         self._wrap(estimator, "demean", "demeaning")
-        self._wrap(estimator, "hc1", "covariance")
-        self._wrap(estimator, "cluster_cr1", "covariance")
+        self._wrap(estimator, "homoskedastic", "covariance")
+        self._wrap(estimator, "hc", "covariance")
+        self._wrap(estimator, "cluster_covariance", "covariance")
+        self._wrap(estimator, "hac", "covariance")
         self._wrap(estimator.np.linalg, "matrix_rank", "rank_check")
         self._wrap(estimator.np.linalg, "cholesky", "factorization")
         self._wrap(estimator.np.linalg, "solve", "linear_solves")
