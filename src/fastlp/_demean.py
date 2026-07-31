@@ -12,15 +12,64 @@ from dataclasses import dataclass
 import numpy as np
 
 try:  # Built by maturin when the optional native backend is available.
-    from ._fastlp_rust import demean_map as _rust_demean_map
+    from ._fastlp_rust import HdfePlan as _RustHdfePlan
 except ImportError:  # pragma: no cover - exercised only in native builds.
-    _rust_demean_map = None
+    _RustHdfePlan = None
 
 
 @dataclass(frozen=True)
 class DemeanDiagnostics:
     iterations: np.ndarray
     backend: str
+    method: str
+
+
+class Residualizer:
+    """Prepared fixed-effect projection with reusable encoded topology."""
+
+    def __init__(self, codes: np.ndarray, group_counts: np.ndarray) -> None:
+        self.codes = np.ascontiguousarray(codes, dtype=np.int64)
+        self.group_counts = np.asarray(group_counts, dtype=np.int64)
+        self._native = (
+            _RustHdfePlan(self.codes, self.group_counts.tolist())
+            if _RustHdfePlan is not None and self.codes.shape[1]
+            else None
+        )
+
+    def transform(
+        self, values: np.ndarray, *, tol: float, max_iter: int
+    ) -> tuple[np.ndarray, DemeanDiagnostics]:
+        values = np.ascontiguousarray(values, dtype=np.float64)
+        if self.codes.shape[1] == 0:
+            return values.copy(), DemeanDiagnostics(
+                np.zeros(values.shape[1], dtype=int), "none", "none"
+            )
+        if self._native is not None:
+            transformed, iterations = self._native.transform(values, tol, max_iter)
+            iterations = np.asarray(iterations, dtype=int)
+            if (iterations < 0).any():
+                raise RuntimeError("fixed-effect demeaning did not converge")
+            return np.asarray(transformed), DemeanDiagnostics(
+                iterations, "rust", "symmetric_kaczmarz"
+            )
+
+        transformed = values.copy()
+        iterations = np.zeros(values.shape[1], dtype=int)
+        for column in range(transformed.shape[1]):
+            vector = transformed[:, column]
+            for iteration in range(1, max_iter + 1):
+                previous = vector.copy()
+                for dimension, n_groups in enumerate(self.group_counts):
+                    group_codes = self.codes[:, dimension]
+                    sums = np.bincount(group_codes, weights=vector, minlength=int(n_groups))
+                    sizes = np.bincount(group_codes, minlength=int(n_groups))
+                    vector -= sums[group_codes] / sizes[group_codes]
+                if np.max(np.abs(vector - previous)) < tol:
+                    iterations[column] = iteration
+                    break
+            else:
+                raise RuntimeError("fixed-effect demeaning did not converge")
+        return transformed, DemeanDiagnostics(iterations, "numpy", "cyclic_kaczmarz")
 
 
 def factorize_effects(frame, columns: tuple[str, ...]) -> tuple[np.ndarray, np.ndarray]:
@@ -48,31 +97,4 @@ def demean(
     max_iter: int,
 ) -> tuple[np.ndarray, DemeanDiagnostics]:
     """Residualize each column of ``values`` against all categorical effects."""
-    values = np.ascontiguousarray(values, dtype=np.float64)
-    if codes.shape[1] == 0:
-        return values.copy(), DemeanDiagnostics(np.zeros(values.shape[1], dtype=int), "none")
-
-    if _rust_demean_map is not None:
-        transformed, iterations = _rust_demean_map(values, codes, group_counts.tolist(), tol, max_iter)
-        iterations = np.asarray(iterations, dtype=int)
-        if (iterations < 0).any():
-            raise RuntimeError("fixed-effect demeaning did not converge")
-        return np.asarray(transformed), DemeanDiagnostics(iterations, "rust")
-
-    transformed = values.copy()
-    iterations = np.zeros(values.shape[1], dtype=int)
-    for column in range(transformed.shape[1]):
-        vector = transformed[:, column]
-        for iteration in range(1, max_iter + 1):
-            previous = vector.copy()
-            for dimension, n_groups in enumerate(group_counts):
-                group_codes = codes[:, dimension]
-                sums = np.bincount(group_codes, weights=vector, minlength=int(n_groups))
-                sizes = np.bincount(group_codes, minlength=int(n_groups))
-                vector -= sums[group_codes] / sizes[group_codes]
-            if np.max(np.abs(vector - previous)) < tol:
-                iterations[column] = iteration
-                break
-        else:
-            raise RuntimeError("fixed-effect demeaning did not converge")
-    return transformed, DemeanDiagnostics(iterations, "numpy")
+    return Residualizer(codes, group_counts).transform(values, tol=tol, max_iter=max_iter)

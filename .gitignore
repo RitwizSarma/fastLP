@@ -1,5 +1,6 @@
 # Rust build artifacts
 rust/target/
+src/fastlp/_fastlp_rust*.so
 
 # Pycache files
 **/__pycache__/

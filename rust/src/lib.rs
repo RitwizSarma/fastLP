@@ -8,6 +8,115 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
 
+#[pyclass]
+struct HdfePlan {
+    n: usize,
+    code_columns: Vec<Vec<usize>>,
+    group_counts: Vec<usize>,
+    group_sizes: Vec<Vec<usize>>,
+}
+
+#[pymethods]
+impl HdfePlan {
+    #[new]
+    fn new(codes: PyReadonlyArray2<'_, i64>, group_counts: Vec<usize>) -> PyResult<Self> {
+        let codes = codes.as_array();
+        if codes.ncols() != group_counts.len() {
+            return Err(PyValueError::new_err("incompatible fixed-effect inputs"));
+        }
+        let n = codes.nrows();
+        let mut code_columns = Vec::with_capacity(codes.ncols());
+        let mut group_sizes = Vec::with_capacity(codes.ncols());
+        for dimension in 0..codes.ncols() {
+            let mut column = Vec::with_capacity(n);
+            let mut sizes = vec![0usize; group_counts[dimension]];
+            for row in 0..n {
+                let code = codes[(row, dimension)];
+                if code < 0 || code as usize >= group_counts[dimension] {
+                    return Err(PyValueError::new_err(
+                        "fixed-effect code is outside its declared range",
+                    ));
+                }
+                column.push(code as usize);
+                sizes[code as usize] += 1;
+            }
+            code_columns.push(column);
+            group_sizes.push(sizes);
+        }
+        Ok(Self {
+            n,
+            code_columns,
+            group_counts,
+            group_sizes,
+        })
+    }
+
+    /// Apply symmetric alternating projections. Immutable FE topology and
+    /// denominators are retained by the plan; per-column work buffers are
+    /// allocated once and reused across iterations.
+    fn transform<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'py, f64>,
+        tol: f64,
+        max_iter: usize,
+    ) -> PyResult<(Bound<'py, PyArray2<f64>>, Bound<'py, PyArray1<i64>>)> {
+        let x = x.as_array();
+        if x.nrows() != self.n {
+            return Err(PyValueError::new_err("incompatible demeaning input"));
+        }
+        let n_columns = x.ncols();
+        let mut columns: Vec<Vec<f64>> = (0..n_columns)
+            .map(|j| (0..self.n).map(|i| x[(i, j)]).collect())
+            .collect();
+        let sweep_dimensions: Vec<usize> = (0..self.code_columns.len())
+            .chain((0..self.code_columns.len().saturating_sub(1)).rev())
+            .collect();
+        let iterations: Vec<i64> = py.allow_threads(|| {
+            columns
+                .par_iter_mut()
+                .map(|column| {
+                    let mut previous = vec![0.0; self.n];
+                    let mut sums: Vec<Vec<f64>> = self
+                        .group_counts
+                        .iter()
+                        .map(|&count| vec![0.0; count])
+                        .collect();
+                    for iteration in 1..=max_iter {
+                        previous.copy_from_slice(column);
+                        for &dimension in &sweep_dimensions {
+                            sums[dimension].fill(0.0);
+                            for row in 0..self.n {
+                                sums[dimension][self.code_columns[dimension][row]] += column[row];
+                            }
+                            for row in 0..self.n {
+                                let group = self.code_columns[dimension][row];
+                                column[row] -= sums[dimension][group]
+                                    / self.group_sizes[dimension][group] as f64;
+                            }
+                        }
+                        if column
+                            .iter()
+                            .zip(previous.iter())
+                            .all(|(a, b)| (a - b).abs() < tol)
+                        {
+                            return iteration as i64;
+                        }
+                    }
+                    -1
+                })
+                .collect()
+        });
+        let flat: Vec<f64> = columns.into_iter().flatten().collect();
+        let output = numpy::ndarray::Array2::from_shape_vec((self.n, n_columns).f(), flat)
+            .map_err(|_| PyValueError::new_err("could not shape output"))?;
+        Ok((
+            PyArray2::from_owned_array_bound(py, output),
+            PyArray1::from_vec_bound(py, iterations),
+        ))
+    }
+}
+
 #[pyfunction]
 fn demean_map<'py>(
     py: Python<'py>,
@@ -17,57 +126,8 @@ fn demean_map<'py>(
     tol: f64,
     max_iter: usize,
 ) -> PyResult<(Bound<'py, PyArray2<f64>>, Bound<'py, PyArray1<i64>>)> {
-    let x = x.as_array();
-    let codes = codes.as_array();
-    if x.nrows() != codes.nrows() || codes.ncols() != group_counts.len() {
-        return Err(PyValueError::new_err("incompatible demeaning inputs"));
-    }
-    let n = x.nrows();
-    let n_columns = x.ncols();
-    let d = codes.ncols();
-    let code_columns: Vec<Vec<usize>> = (0..d)
-        .map(|j| (0..n).map(|i| codes[(i, j)] as usize).collect())
-        .collect();
-    let mut columns: Vec<Vec<f64>> = (0..n_columns)
-        .map(|j| (0..n).map(|i| x[(i, j)]).collect())
-        .collect();
-    let iterations: Vec<i64> = py.allow_threads(|| {
-        columns
-            .par_iter_mut()
-            .map(|column| {
-                for iteration in 1..=max_iter {
-                    let previous = column.clone();
-                    for dimension in 0..d {
-                        let mut sums = vec![0.0; group_counts[dimension]];
-                        let mut sizes = vec![0usize; group_counts[dimension]];
-                        for row in 0..n {
-                            sums[code_columns[dimension][row]] += column[row];
-                            sizes[code_columns[dimension][row]] += 1;
-                        }
-                        for row in 0..n {
-                            let group = code_columns[dimension][row];
-                            column[row] -= sums[group] / sizes[group] as f64;
-                        }
-                    }
-                    if column
-                        .iter()
-                        .zip(previous.iter())
-                        .all(|(a, b)| (a - b).abs() < tol)
-                    {
-                        return iteration as i64;
-                    }
-                }
-                -1
-            })
-            .collect()
-    });
-    let flat: Vec<f64> = columns.into_iter().flatten().collect();
-    let output = numpy::ndarray::Array2::from_shape_vec((n, n_columns).f(), flat)
-        .map_err(|_| PyValueError::new_err("could not shape output"))?;
-    Ok((
-        PyArray2::from_owned_array_bound(py, output),
-        PyArray1::from_vec_bound(py, iterations),
-    ))
+    let plan = HdfePlan::new(codes, group_counts)?;
+    plan.transform(py, x, tol, max_iter)
 }
 
 /// Accumulate one cluster-score meat matrix per residual column.
@@ -137,6 +197,7 @@ fn cluster_meat<'py>(
 
 #[pymodule]
 fn _fastlp_rust(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_class::<HdfePlan>()?;
     module.add_function(wrap_pyfunction!(demean_map, module)?)?;
     module.add_function(wrap_pyfunction!(cluster_meat, module)?)?;
     Ok(())

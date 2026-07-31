@@ -17,7 +17,7 @@ from ._covariance import (
     hc,
     homoskedastic,
 )
-from ._demean import demean, factorize_effects
+from ._demean import Residualizer, factorize_effects
 
 
 def _as_columns(value: str | Sequence[str] | None, name: str) -> tuple[str, ...]:
@@ -32,6 +32,7 @@ def _as_columns(value: str | Sequence[str] | None, name: str) -> tuple[str, ...]
 
 
 ClusterTerm = str | tuple[str, ...]
+_HORIZON_BATCH_SIZE = 32
 
 
 def _as_cluster_terms(value: ClusterTerm | Sequence[ClusterTerm] | None) -> tuple[tuple[str, ...], ...]:
@@ -260,7 +261,10 @@ class LocalProjection:
         if frame.duplicated([unit, time]).any():
             raise ValueError("unit and time must uniquely identify panel observations")
 
-        frame = frame.sort_values([unit, time], kind="stable")
+        panel_order = pd.MultiIndex.from_frame(frame[[unit, time]])
+        input_was_sorted = panel_order.is_monotonic_increasing
+        if not input_was_sorted:
+            frame = frame.sort_values([unit, time], kind="stable")
         frame, lag_feature_names, valid_lag_rows = _add_lags(frame, unit, lag_requests)
         if frame.empty:
             raise ValueError("data must contain at least one panel unit")
@@ -296,6 +300,7 @@ class LocalProjection:
         cache_group_by_horizon = np.empty(n_horizons, dtype=int)
         x_iterations_by_group: list[np.ndarray] = []
         backends: list[str] = []
+        methods: list[str] = []
 
         for group_id, (mask, horizons) in enumerate(zip(group_masks, groups.values(), strict=True)):
             if not mask.any():
@@ -303,15 +308,10 @@ class LocalProjection:
             positions = np.flatnonzero(mask)
             anchor = frame.iloc[positions]
             x = base_x[mask]
-            y = np.column_stack(
-                [outcome_values[future_positions[mask, horizon]] for horizon in horizons]
-            )
             effect_codes, effect_counts = factorize_effects(anchor, effects)
-            x_tilde, x_diag = demean(
-                x, effect_codes, effect_counts, tol=self.demean_tol, max_iter=self.max_iter
-            )
-            y_tilde, y_diag = demean(
-                y, effect_codes, effect_counts, tol=self.demean_tol, max_iter=self.max_iter
+            residualizer = Residualizer(effect_codes, effect_counts)
+            x_tilde, x_diag = residualizer.transform(
+                x, tol=self.demean_tol, max_iter=self.max_iter
             )
             gram = (x_tilde.T @ x_tilde)
             gram = (gram + gram.T) / 2
@@ -325,66 +325,72 @@ class LocalProjection:
             except np.linalg.LinAlgError as error:
                 raise ValueError("residualized design is not positive definite") from error
             bread = np.linalg.solve(chol.T, np.linalg.solve(chol, np.eye(rank)))
-            coef = np.linalg.solve(chol.T, np.linalg.solve(chol, x_tilde.T @ y_tilde))
-            residuals = y_tilde - x_tilde @ coef
-            if self.covariance == "homoskedastic":
-                covariance = homoskedastic(x_tilde, residuals, bread)
-                covariance_diagnostics = tuple({"kind": "homoskedastic"} for _ in horizons)
-            elif self.covariance in {"hc0", "hc1", "hc2", "hc3"}:
-                covariance = hc(x_tilde, residuals, bread, self.covariance)
-                covariance_diagnostics = tuple({"kind": self.covariance} for _ in horizons)
-            elif self.covariance == "cluster":
+            cluster_data = None
+            if self.covariance == "cluster":
                 cluster_codes, labels = factorize_cluster_terms(anchor, cluster_terms)
-                covariance, cluster_diagnostics = cluster_covariance(
-                    x_tilde,
-                    residuals,
-                    cluster_codes,
-                    labels,
-                    bread,
-                    self.cluster_correction,
+                cluster_data = (cluster_codes, labels)
+
+            for batch_start in range(0, len(horizons), _HORIZON_BATCH_SIZE):
+                batch_horizons = horizons[batch_start : batch_start + _HORIZON_BATCH_SIZE]
+                y = np.column_stack(
+                    [outcome_values[future_positions[mask, horizon]] for horizon in batch_horizons]
                 )
-                covariance_diagnostics = tuple(
-                    {
-                        "kind": "cluster",
-                        "correction": self.cluster_correction,
-                        "components": cluster_diagnostics,
-                    }
-                    for _ in horizons
+                y_tilde, y_diag = residualizer.transform(
+                    y, tol=self.demean_tol, max_iter=self.max_iter
                 )
-            else:
-                covariance, covariance_diagnostics = hac(
-                    x_tilde,
-                    residuals,
-                    anchor[unit],
-                    anchor[time],
-                    horizons,
-                    bread,
-                    max_lags=self.hac_lags,
-                    kernel=self.hac_kernel,
-                    debias=self.hac_debias,
-                    driscoll_kraay=self.covariance == "driscoll_kraay",
-                )
-            covariance = (covariance + covariance.transpose(0, 2, 1)) / 2
-            diagonal = np.diagonal(covariance, axis1=1, axis2=2)
-            scale = np.maximum(np.max(np.abs(covariance), axis=(1, 2)), 1.0)
-            materially_negative = diagonal < -np.finfo(float).eps * scale[:, None] * 100
-            if materially_negative.any():
-                horizon, feature = np.argwhere(materially_negative)[0]
-                raise ValueError(
-                    f"{self.covariance} covariance has a negative variance at horizon "
-                    f"{horizons[int(horizon)]}, feature {int(feature)}"
-                )
-            stderr = np.sqrt(np.maximum(diagonal, 0.0))
-            coefficients[horizons] = coef.T
-            standard_errors[horizons] = stderr
-            covariances[horizons] = covariance
-            for column, horizon in enumerate(horizons):
-                residuals_by_horizon[horizon] = residuals[:, column]
-                y_iterations[horizon] = y_diag.iterations[column]
-                cache_group_by_horizon[horizon] = group_id
-                covariance_diagnostics_by_horizon[horizon] = covariance_diagnostics[column]
+                coef = np.linalg.solve(chol.T, np.linalg.solve(chol, x_tilde.T @ y_tilde))
+                residuals = y_tilde - x_tilde @ coef
+                if self.covariance == "homoskedastic":
+                    covariance = homoskedastic(x_tilde, residuals, bread)
+                    covariance_diagnostics = tuple(
+                        {"kind": "homoskedastic"} for _ in batch_horizons
+                    )
+                elif self.covariance in {"hc0", "hc1", "hc2", "hc3"}:
+                    covariance = hc(x_tilde, residuals, bread, self.covariance)
+                    covariance_diagnostics = tuple(
+                        {"kind": self.covariance} for _ in batch_horizons
+                    )
+                elif self.covariance == "cluster":
+                    assert cluster_data is not None
+                    covariance, cluster_diagnostics = cluster_covariance(
+                        x_tilde, residuals, *cluster_data, bread, self.cluster_correction
+                    )
+                    covariance_diagnostics = tuple(
+                        {
+                            "kind": "cluster",
+                            "correction": self.cluster_correction,
+                            "components": cluster_diagnostics,
+                        }
+                        for _ in batch_horizons
+                    )
+                else:
+                    covariance, covariance_diagnostics = hac(
+                        x_tilde, residuals, anchor[unit], anchor[time], batch_horizons, bread,
+                        max_lags=self.hac_lags, kernel=self.hac_kernel, debias=self.hac_debias,
+                        driscoll_kraay=self.covariance == "driscoll_kraay",
+                    )
+                covariance = (covariance + covariance.transpose(0, 2, 1)) / 2
+                diagonal = np.diagonal(covariance, axis1=1, axis2=2)
+                scale = np.maximum(np.max(np.abs(covariance), axis=(1, 2)), 1.0)
+                materially_negative = diagonal < -np.finfo(float).eps * scale[:, None] * 100
+                if materially_negative.any():
+                    local_horizon, feature = np.argwhere(materially_negative)[0]
+                    raise ValueError(
+                        f"{self.covariance} covariance has a negative variance at horizon "
+                        f"{batch_horizons[int(local_horizon)]}, feature {int(feature)}"
+                    )
+                stderr = np.sqrt(np.maximum(diagonal, 0.0))
+                coefficients[batch_horizons] = coef.T
+                standard_errors[batch_horizons] = stderr
+                covariances[batch_horizons] = covariance
+                for column, horizon in enumerate(batch_horizons):
+                    residuals_by_horizon[horizon] = residuals[:, column]
+                    y_iterations[horizon] = y_diag.iterations[column]
+                    cache_group_by_horizon[horizon] = group_id
+                    covariance_diagnostics_by_horizon[horizon] = covariance_diagnostics[column]
             x_iterations_by_group.append(x_diag.iterations)
             backends.append(x_diag.backend)
+            methods.append(x_diag.method)
 
         z_value = NormalDist().inv_cdf(1 - self.alpha / 2)
         sample_indices = tuple(frame.index[mask].copy() for mask in masks.T)
@@ -425,7 +431,10 @@ class LocalProjection:
             "x_iterations_by_cache_group": tuple(x_iterations_by_group),
             "y_iterations": y_iterations,
             "backend": backends[0],
+            "method": methods[0],
+            "method_by_cache_group": tuple(methods),
             "cache_mode": "shared_design" if len(group_masks) == 1 else "mask_grouped",
+            "input_was_sorted": input_was_sorted,
         }
         return self
 

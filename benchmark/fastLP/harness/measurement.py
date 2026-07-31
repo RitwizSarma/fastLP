@@ -79,7 +79,7 @@ class _StageHooks:
         import fastlp.estimator as estimator
 
         self._wrap(estimator, "factorize_effects", "fe_encoding")
-        self._wrap(estimator, "demean", "demeaning")
+        self._wrap(estimator.Residualizer, "transform", "demeaning")
         self._wrap(estimator, "homoskedastic", "covariance")
         self._wrap(estimator, "hc", "covariance")
         self._wrap(estimator, "cluster_covariance", "covariance")

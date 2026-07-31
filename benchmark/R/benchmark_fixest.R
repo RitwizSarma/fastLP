@@ -32,12 +32,21 @@ horizon_max <- config[[dataset]]$horizon
 
 results <- vector("list", horizon_max + 1L)
 calculation_start <- proc.time()[["elapsed"]]
+# Construct the same exact-time common anchor sample used by fastLP. This is
+# deliberately timed because fastLP's reported fit includes sample alignment.
+observed_keys <- paste(data$unit, data$time, sep = "\r")
+common_sample <- rep(TRUE, nrow(data))
+for (h in 0:horizon_max) {
+  future_keys <- paste(data$unit, data$time + h, sep = "\r")
+  common_sample <- common_sample & future_keys %in% observed_keys
+}
 for (h in 0:horizon_max) {
   # f(outcome, h) is outcome at t+h. panel.id makes leads respect missing
   # periods, which is necessary for the unbalanced datasets.
   fit <- fixest::feols(
     stats::as.formula(sprintf("f(outcome, %d) ~ shock + control | unit + time", h)),
     data = data,
+    subset = common_sample,
     panel.id = ~unit + time,
     panel.time.step = "unitary",
     vcov = ~unit

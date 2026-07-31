@@ -31,10 +31,17 @@ It writes `results_fixest_<dataset>.csv` in this directory. Its reported
 calculation time covers the complete set of horizon regressions, but excludes
 CSV loading and result-file writing.
 
-To run Stata, set `dataset` at the top of `Stata/benchmark_locproj.do`, ensure
-`locproj` is installed, and execute the do-file with `benchmark/Stata` as the
-working directory. It uses `fe` for unit fixed effects, `i.time` for time fixed
-effects, and clusters at the unit level. The timer covers `locproj` only.
+To run Stata, set `dataset` at the top of either
+`Stata/benchmark_locproj.do` or `Stata/benchmark_reghdfe.do` and execute the
+do-file with `benchmark/Stata` as the working directory. The direct reghdfe
+runner constructs the exact-time common sample and then estimates every
+horizon with unit and time fixed effects and unit-clustered covariance. Its
+timer includes sample construction, matching fastLP's in-memory fit boundary.
+
+The R runner uses the same common sample. Cross-language speed claims are valid
+only when the sample, regressors, FE structure, covariance correction, thread
+policy, and timed boundary agree. Report cold and warmed medians on the same
+machine; warm-up runs are measurement hygiene, not estimator caching.
 
 To run fastLP, choose a dataset on the command line from the project root:
 

@@ -3,6 +3,7 @@ import pandas as pd
 import pytest
 
 from fastlp import LocalProjection
+from fastlp._demean import Residualizer, factorize_effects
 
 
 def balanced_panel() -> pd.DataFrame:
@@ -52,8 +53,59 @@ def test_fixed_effects_remove_intercept_and_converge() -> None:
     )
     assert list(fitted.feature_names_in_) == ["shock", "control"]
     assert fitted.demeaning_diagnostics_["backend"] in {"numpy", "rust"}
+    assert fitted.demeaning_diagnostics_["method"] in {
+        "cyclic_kaczmarz", "symmetric_kaczmarz"
+    }
     assert np.all(fitted.demeaning_diagnostics_["x_iterations"] > 0)
     assert fitted.covariance_.shape == (2, 2, 2)
+
+
+def test_prepared_residualizer_reuses_topology_and_matches_group_projection() -> None:
+    data = balanced_panel()
+    codes, counts = factorize_effects(data, ("unit", "time"))
+    plan = Residualizer(codes, counts)
+    values = data[["y", "shock", "control"]].to_numpy()
+    first, first_diag = plan.transform(values, tol=1e-10, max_iter=10_000)
+    second, second_diag = plan.transform(values[:, :1], tol=1e-10, max_iter=10_000)
+
+    np.testing.assert_allclose(first[:, :1], second, atol=1e-12)
+    for dimension in range(codes.shape[1]):
+        for group in range(counts[dimension]):
+            np.testing.assert_allclose(
+                first[codes[:, dimension] == group].mean(axis=0), 0.0, atol=1e-10
+            )
+    assert first_diag.backend == second_diag.backend
+
+
+def test_fit_reports_sorted_fast_path() -> None:
+    data = balanced_panel()
+    sorted_fit = LocalProjection(horizons=1, covariance="hc1").fit(
+        data, outcome="y", shock="shock", unit="unit", time="time"
+    )
+    shuffled_fit = LocalProjection(horizons=1, covariance="hc1").fit(
+        data.sample(frac=1, random_state=42),
+        outcome="y", shock="shock", unit="unit", time="time"
+    )
+    assert sorted_fit.demeaning_diagnostics_["input_was_sorted"] is True
+    assert shuffled_fit.demeaning_diagnostics_["input_was_sorted"] is False
+    np.testing.assert_allclose(sorted_fit.coef_, shuffled_fit.coef_, atol=1e-12)
+
+
+def test_horizon_batches_preserve_results(monkeypatch: pytest.MonkeyPatch) -> None:
+    import fastlp.estimator as estimator
+
+    data = covariance_panel()
+    unbatched = LocalProjection(horizons=3, covariance="cluster").fit(
+        data, outcome="y", shock="shock", controls=["control"],
+        unit="unit", time="time", fixed_effects=["unit"], cluster="unit"
+    )
+    monkeypatch.setattr(estimator, "_HORIZON_BATCH_SIZE", 2)
+    batched = LocalProjection(horizons=3, covariance="cluster").fit(
+        data, outcome="y", shock="shock", controls=["control"],
+        unit="unit", time="time", fixed_effects=["unit"], cluster="unit"
+    )
+    np.testing.assert_allclose(batched.coef_, unbatched.coef_, atol=1e-12)
+    np.testing.assert_allclose(batched.covariance_, unbatched.covariance_, atol=1e-12)
 
 
 def test_common_sample_accepts_unbalanced_panel_and_reports_shared_rows() -> None:

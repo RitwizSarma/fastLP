@@ -58,3 +58,8 @@ uv run maturin develop --manifest-path rust/Cargo.toml
 ```
 
 Without Rust, the package uses its equivalent NumPy implementation.
+The native backend prepares fixed-effect topology once per distinct horizon
+sample, reuses it for the RHS and outcome transforms, and applies symmetric
+Kaczmarz sweeps with reusable iteration buffers. The selected method and
+whether the input used the already-sorted fast path are recorded in
+`demeaning_diagnostics_`.
