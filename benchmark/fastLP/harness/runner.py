@@ -111,6 +111,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--fixed-effects", nargs="*", default=["unit", "time"])
     parser.add_argument("--threads", type=int, help="set coordinated Rayon/BLAS thread counts")
+    parser.add_argument("--response", choices=("level", "cumulative"), default="level")
+    parser.add_argument("--memory-budget", help="working-memory budget, for example 4GB")
+    parser.add_argument(
+        "--discard-residuals", action="store_true", help="do not retain residual arrays"
+    )
     parser.add_argument("--validate", action="store_true", help="compare with independent-horizon reference if balanced")
     parser.add_argument("--baseline", action="store_true", help="also time the independent-horizon reference")
     parser.add_argument("--profile", action="store_true", help="write a cProfile report for one fastLP fit")
@@ -164,6 +169,9 @@ def main() -> None:
             horizons=horizons,
             covariance=args.covariance,
             sample="common" if balanced else "per_horizon",
+            response=args.response,
+            memory_budget=args.memory_budget,
+            retain_residuals=not args.discard_residuals,
         )
         return model.fit(data, **fit_options)
 
@@ -183,7 +191,7 @@ def main() -> None:
         reference = None
         agreement: dict[str, Any]
         if args.validate or args.baseline:
-            if balanced and args.covariance in {"cluster", "hc1"}:
+            if balanced and args.response == "level" and args.covariance in {"cluster", "hc1"}:
                 reference_call = lambda: fit_independent_horizons(
                     data, horizons=horizons, covariance=args.covariance, fixed_effects=effects, cluster=cluster, controls=controls
                 )
@@ -197,7 +205,7 @@ def main() -> None:
                 baseline = None
                 agreement = {
                     "available": False,
-                    "reason": "reference currently supports only balanced hc1 and one-way cluster covariance",
+                    "reason": "reference currently supports only balanced level-response hc1 and one-way cluster covariance",
                 }
         else:
             baseline = None
@@ -224,10 +232,27 @@ def main() -> None:
             "covariance": args.covariance,
             "sample": "common" if balanced else "per_horizon",
             "balanced": balanced,
+            "response": args.response,
+            "memory_budget": args.memory_budget,
+            "retain_residuals": not args.discard_residuals,
             "warmups": args.warmups,
             "repetitions": args.repetitions,
         },
         "wall_seconds": {"min": min(item.wall_seconds for item in measurements), "median": float(np.median([item.wall_seconds for item in measurements])), "max": max(item.wall_seconds for item in measurements)},
+        "peak_rss_bytes": {
+            "max": max(
+                (item.peak_rss_bytes for item in measurements if item.peak_rss_bytes is not None),
+                default=None,
+            )
+        },
+        "stages_seconds_median": {
+            stage: float(
+                np.median([item.stages_seconds.get(stage, 0.0) for item in measurements])
+            )
+            for stage in sorted(
+                {stage for item in measurements for stage in item.stages_seconds}
+            )
+        },
         "agreement": agreement,
     }
     if baseline is not None:

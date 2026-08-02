@@ -1,8 +1,9 @@
 import numpy as np
 import pandas as pd
 import pytest
+import warnings
 
-from fastlp import LocalProjection
+from fastlp import FewClustersWarning, LocalProjection
 from fastlp._demean import Residualizer, factorize_effects
 
 
@@ -35,7 +36,7 @@ def test_cached_no_fe_matches_separate_ols() -> None:
     np.testing.assert_allclose(fitted.coef_, np.asarray(expected), atol=1e-10)
     assert fitted.n_obs_ == 24
     assert list(fitted.to_frame().columns) == [
-        "horizon", "sample", "n_obs", "coefficient", "estimate", "std_error", "ci_low", "ci_high"
+        "horizon", "sample", "response", "n_obs", "coefficient", "estimate", "std_error", "ci_low", "ci_high"
     ]
 
 
@@ -54,7 +55,7 @@ def test_fixed_effects_remove_intercept_and_converge() -> None:
     assert list(fitted.feature_names_in_) == ["shock", "control"]
     assert fitted.demeaning_diagnostics_["backend"] in {"numpy", "rust"}
     assert fitted.demeaning_diagnostics_["method"] in {
-        "cyclic_kaczmarz", "symmetric_kaczmarz"
+        "cyclic_kaczmarz", "symmetric_kaczmarz", "exact_balanced_two_way"
     }
     assert np.all(fitted.demeaning_diagnostics_["x_iterations"] > 0)
     assert fitted.covariance_.shape == (2, 2, 2)
@@ -394,3 +395,344 @@ def test_unbalanced_lagged_design_matches_separate_ols() -> None:
         expected.append(np.linalg.lstsq(np.asarray(x_rows), y_rows, rcond=None)[0])
 
     np.testing.assert_allclose(fitted.coef_, expected, atol=1e-10)
+
+
+def test_cumulative_response_matches_manual_regressions() -> None:
+    data = covariance_panel()
+    fitted = LocalProjection(horizons=3, covariance="hc1", response="cumulative").fit(
+        data,
+        outcome="y",
+        shock="shock",
+        controls=["control"],
+        unit="unit",
+        time="time",
+    )
+    expected = []
+    for horizon in range(4):
+        rows = []
+        outcomes = []
+        for _, panel in data.groupby("unit", sort=True):
+            panel = panel.sort_values("time").reset_index(drop=True)
+            for anchor in range(len(panel) - 3):
+                row = panel.iloc[anchor]
+                rows.append([1.0, row.shock, row.control])
+                outcomes.append(panel.y.iloc[anchor : anchor + horizon + 1].sum())
+        expected.append(np.linalg.lstsq(np.asarray(rows), outcomes, rcond=None)[0])
+    np.testing.assert_allclose(fitted.coef_, expected, atol=1e-10)
+    assert fitted.response_ == "cumulative"
+    assert set(fitted.to_frame()["response"]) == {"cumulative"}
+
+
+def test_cumulative_per_horizon_requires_every_intermediate_outcome() -> None:
+    data = balanced_panel().query("not (unit == 0 and time == 3)")
+    fitted = LocalProjection(
+        horizons=2, covariance="hc1", response="cumulative", sample="per_horizon"
+    ).fit(data, outcome="y", shock="shock", unit="unit", time="time")
+    assert fitted.n_obs_by_horizon_[2] < fitted.n_obs_by_horizon_[0]
+    indexed = data.set_index(["unit", "time"])["y"]
+    for source_index in fitted.sample_index_by_horizon_[2]:
+        row = data.loc[source_index]
+        assert all((row.unit, row.time + step) in indexed.index for step in range(3))
+
+
+def test_balanced_fast_path_matches_general_demeaning() -> None:
+    data = covariance_panel()
+    fitted = LocalProjection(horizons=2, covariance="hc1").fit(
+        data,
+        outcome="y",
+        shock="shock",
+        controls=["control"],
+        unit="unit",
+        time="time",
+        fixed_effects=["unit", "time"],
+    )
+    assert fitted.demeaning_diagnostics_["lead_path"] == "balanced_arithmetic"
+    assert fitted.demeaning_diagnostics_["method"] == "exact_balanced_two_way"
+    anchors = data.query("time <= 11").copy()
+    codes, counts = factorize_effects(anchors, ("unit", "time"))
+    residualizer = Residualizer(codes, counts)
+    x = anchors[["shock", "control"]].to_numpy()
+    x_tilde, _ = residualizer.transform(x, tol=1e-12, max_iter=10_000)
+    expected = []
+    for horizon in range(3):
+        y = np.concatenate(
+            [panel.y.to_numpy()[horizon : horizon + 12] for _, panel in data.groupby("unit")]
+        )
+        y_tilde, _ = residualizer.transform(y[:, None], tol=1e-12, max_iter=10_000)
+        expected.append(np.linalg.lstsq(x_tilde, y_tilde[:, 0], rcond=None)[0])
+    np.testing.assert_allclose(fitted.coef_, expected, atol=1e-10)
+
+
+def test_memory_budget_and_residual_retention() -> None:
+    fitted = LocalProjection(
+        horizons=3,
+        covariance="cluster",
+        retain_residuals=False,
+        memory_budget="1KB",
+    ).fit(
+        covariance_panel(),
+        outcome="y",
+        shock="shock",
+        unit="unit",
+        time="time",
+        cluster="unit",
+    )
+    assert fitted.residuals_ is None
+    assert fitted.demeaning_diagnostics_["batch_size"] == 1
+
+
+def test_new_option_validation() -> None:
+    with pytest.raises(ValueError, match="response must be"):
+        LocalProjection(horizons=1, response="ratio")
+    with pytest.raises(ValueError, match="memory_budget"):
+        LocalProjection(horizons=1, memory_budget="plenty")
+    with pytest.raises(ValueError, match="retain_residuals"):
+        LocalProjection(horizons=1, retain_residuals=1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="demean_acceleration"):
+        LocalProjection(horizons=1, demean_acceleration="turbo")
+    with pytest.raises(ValueError, match="few_cluster_threshold"):
+        LocalProjection(horizons=1, few_cluster_threshold=1)
+    with pytest.raises(ValueError, match="singleton_policy"):
+        LocalProjection(horizons=1, singleton_policy="sometimes")
+
+
+def test_unbalanced_single_effect_uses_exact_group_transform() -> None:
+    data = covariance_panel().query("not (unit == 0 and time in [3, 7])")
+    fitted = LocalProjection(horizons=1, covariance="hc1", sample="per_horizon").fit(
+        data,
+        outcome="y",
+        shock="shock",
+        unit="unit",
+        time="time",
+        fixed_effects=["unit"],
+    )
+    assert set(fitted.demeaning_diagnostics_["method_by_cache_group"]) == {
+        "exact_group_unit"
+    }
+
+
+def test_balanced_demeaning_keeps_numpy_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    import fastlp._demean as demeaning
+
+    rng = np.random.default_rng(2468)
+    values = rng.normal(size=(5 * 7, 3))
+    native, native_backend = demeaning.balanced_demean(
+        values, 5, 7, unit_effect=True, time_effect=True
+    )
+    monkeypatch.setattr(demeaning, "_rust_demean_balanced", None)
+    fallback, fallback_backend = demeaning.balanced_demean(
+        values, 5, 7, unit_effect=True, time_effect=True
+    )
+
+    assert native_backend == "rust"
+    assert fallback_backend == "numpy"
+    np.testing.assert_allclose(fallback, native, atol=1e-12)
+
+
+def test_accelerated_three_way_absorption_matches_reference() -> None:
+    rng = np.random.default_rng(13579)
+    n_obs = 1_000
+    effects = pd.DataFrame(
+        {
+            "first": rng.integers(0, 70, n_obs),
+            "second": rng.integers(0, 45, n_obs),
+            "third": rng.integers(0, 30, n_obs),
+        }
+    )
+    codes, counts = factorize_effects(effects, ("first", "second", "third"))
+    values = rng.normal(size=(n_obs, 4))
+    plan = Residualizer(codes, counts)
+    aitken, aitken_diag = plan.transform(
+        values, tol=1e-10, max_iter=10_000, acceleration="aitken"
+    )
+    accelerated, accelerated_diag = plan.transform(
+        values, tol=1e-10, max_iter=10_000, acceleration="irons_tuck"
+    )
+    reference, reference_diag = plan.transform(
+        values, tol=1e-10, max_iter=10_000, acceleration="none"
+    )
+    plan._native = None
+    numpy_accelerated, numpy_diag = plan.transform(
+        values, tol=1e-10, max_iter=10_000, acceleration="irons_tuck"
+    )
+
+    np.testing.assert_allclose(aitken, reference, atol=5e-10)
+    np.testing.assert_allclose(accelerated, reference, atol=5e-10)
+    np.testing.assert_allclose(numpy_accelerated, reference, atol=5e-10)
+    assert aitken_diag.method == "symmetric_kaczmarz_aitken"
+    assert accelerated_diag.method == "symmetric_kaczmarz_irons_tuck"
+    assert accelerated_diag.acceleration_accepted.sum() > 0
+    assert reference_diag.acceleration_accepted.sum() == 0
+    assert numpy_diag.backend == "numpy"
+    assert numpy_diag.acceleration_accepted.sum() > 0
+    for dimension, n_groups in enumerate(counts):
+        for group in range(n_groups):
+            np.testing.assert_allclose(
+                accelerated[codes[:, dimension] == group].mean(axis=0), 0.0, atol=1e-10
+            )
+
+
+def test_few_cluster_warning_and_opt_out() -> None:
+    data = covariance_panel()
+    with pytest.warns(FewClustersWarning, match="only 8 clusters"):
+        LocalProjection(
+            horizons=1, covariance="cluster", few_cluster_threshold=50
+        ).fit(
+            data,
+            outcome="y",
+            shock="shock",
+            unit="unit",
+            time="time",
+            cluster="unit",
+        )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", FewClustersWarning)
+        LocalProjection(
+            horizons=1, covariance="cluster", few_cluster_threshold=None
+        ).fit(
+            data,
+            outcome="y",
+            shock="shock",
+            unit="unit",
+            time="time",
+            cluster="unit",
+        )
+
+
+def test_recursive_singleton_pruning_reaches_stable_sample() -> None:
+    edges = [
+        (0, 0),
+        (0, 1),
+        (1, 0),
+        (1, 1),
+        (1, 2),
+        (2, 2),
+        (2, 3),
+        (3, 3),
+    ]
+    rng = np.random.default_rng(8642)
+    data = pd.DataFrame(
+        {
+            "unit": np.arange(len(edges)),
+            "time": np.zeros(len(edges), dtype=int),
+            "first_fe": [edge[0] for edge in edges],
+            "second_fe": [edge[1] for edge in edges],
+            "y": rng.normal(size=len(edges)),
+            "shock": rng.normal(size=len(edges)),
+        }
+    )
+    dropped = LocalProjection(
+        horizons=0, covariance="hc1", singleton_policy="drop"
+    ).fit(
+        data,
+        outcome="y",
+        shock="shock",
+        unit="unit",
+        time="time",
+        fixed_effects=["first_fe", "second_fe"],
+    )
+    kept = LocalProjection(
+        horizons=0, covariance="hc1", singleton_policy="keep"
+    ).fit(
+        data,
+        outcome="y",
+        shock="shock",
+        unit="unit",
+        time="time",
+        fixed_effects=["first_fe", "second_fe"],
+    )
+
+    assert dropped.n_obs_ == 4
+    assert dropped.sample_index_.tolist() == [0, 1, 2, 3]
+    assert dropped.singleton_diagnostics_["dropped_by_horizon"].tolist() == [4]
+    assert dropped.singleton_diagnostics_["rounds_by_horizon"].tolist() == [4]
+    assert kept.n_obs_ == 8
+    assert kept.singleton_diagnostics_["dropped_by_horizon"].tolist() == [0]
+
+
+def test_per_horizon_singletons_are_pruned_before_cache_grouping() -> None:
+    rng = np.random.default_rng(97531)
+    data = pd.DataFrame(
+        [
+            {
+                "unit": unit,
+                "time": time,
+                "y": rng.normal(),
+                "shock": rng.normal(),
+            }
+            for unit, periods in enumerate((3, 4, 5))
+            for time in range(periods)
+        ]
+    )
+    fitted = LocalProjection(
+        horizons=2, covariance="hc1", sample="per_horizon"
+    ).fit(
+        data,
+        outcome="y",
+        shock="shock",
+        unit="unit",
+        time="time",
+        fixed_effects=["unit"],
+    )
+
+    assert fitted.n_obs_by_horizon_.tolist() == [12, 9, 5]
+    assert fitted.singleton_diagnostics_["dropped_by_horizon"].tolist() == [0, 0, 1]
+    assert fitted.singleton_diagnostics_["rounds_by_horizon"].tolist() == [0, 0, 1]
+
+
+def test_irf_plot_is_cached_styled_and_selectable() -> None:
+    import matplotlib.pyplot as plt
+
+    data = covariance_panel().copy()
+    data["shock_2"] = np.roll(data["shock"].to_numpy(), 1)
+    fitted = LocalProjection(horizons=3, covariance="hc1").fit(
+        data,
+        outcome="y",
+        shock=["shock", "shock_2"],
+        controls=["control"],
+        unit="unit",
+        time="time",
+    )
+
+    default = fitted.irfplot
+    assert default is fitted.irfplot
+    assert default.get_facecolor() == (1.0, 1.0, 1.0, 1.0)
+    assert default.get_xlabel() == "Horizon"
+    assert "shock" in default.get_title(loc="left")
+    assert len(default.collections) == 1
+    selected = fitted.plot_irf("shock_2", show_zero_line=False, title="Second shock")
+    assert selected.get_title(loc="left") == "Second shock"
+    assert len(selected.lines) == 1
+    with pytest.raises(ValueError, match="not a fitted shock"):
+        fitted.plot_irf("control")
+    plt.close(default.figure)
+    plt.close(selected.figure)
+
+
+def test_nearly_unit_spaced_time_uses_exact_indexed_leads() -> None:
+    rows = []
+    for unit in range(4):
+        for time in (0.0, 1.0, 2.000000001, 3.0):
+            rows.append(
+                {
+                    "unit": unit,
+                    "time": time,
+                    "y": unit + 0.5 * time,
+                    "shock": (unit + 1) * (time + 1),
+                }
+            )
+    data = pd.DataFrame(rows)
+    fitted = LocalProjection(
+        horizons=1, covariance="hc1", sample="per_horizon"
+    ).fit(
+        data,
+        outcome="y",
+        shock="shock",
+        unit="unit",
+        time="time",
+    )
+
+    assert fitted.demeaning_diagnostics_["lead_path"] == "indexed"
+    assert fitted.n_obs_by_horizon_.tolist() == [16, 4]
+    expected_horizon_one = data.index[data["time"] == 0.0].tolist()
+    assert fitted.sample_index_by_horizon_[1].tolist() == expected_horizon_one

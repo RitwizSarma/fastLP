@@ -10,5 +10,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 numpy = "0.22"
-pyo3 = { version = "0.22", features = ["extension-module"] }
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py312"] }
 rayon = "1.10"

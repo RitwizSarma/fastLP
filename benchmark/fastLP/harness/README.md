@@ -44,3 +44,8 @@ derived safely from an arbitrary file. Use `--threads N` to set one coordinated 
 `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, and `OMP_NUM_THREADS` policy for a
 run. This makes oversubscription experiments reproducible. The chosen policy
 and any existing thread settings are stored in `summary.json`.
+
+Use `--response cumulative` to exercise cumulative responses,
+`--memory-budget 4GB` to test adaptive horizon batching, and
+`--discard-residuals` for the low-memory result path. The independent-horizon
+validation fixture currently covers level responses only.

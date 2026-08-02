@@ -16,6 +16,24 @@ struct HdfePlan {
     group_sizes: Vec<Vec<usize>>,
 }
 
+fn projection_error(
+    values: &[f64],
+    code_columns: &[Vec<usize>],
+    group_sizes: &[Vec<usize>],
+) -> f64 {
+    let mut largest = 0.0f64;
+    for (codes, sizes) in code_columns.iter().zip(group_sizes.iter()) {
+        let mut sums = vec![0.0; sizes.len()];
+        for (row, &group) in codes.iter().enumerate() {
+            sums[group] += values[row];
+        }
+        for (sum, &size) in sums.iter().zip(sizes.iter()) {
+            largest = largest.max((sum / size as f64).abs());
+        }
+    }
+    largest
+}
+
 #[pymethods]
 impl HdfePlan {
     #[new]
@@ -60,10 +78,18 @@ impl HdfePlan {
         x: PyReadonlyArray2<'py, f64>,
         tol: f64,
         max_iter: usize,
-    ) -> PyResult<(Bound<'py, PyArray2<f64>>, Bound<'py, PyArray1<i64>>)> {
+        acceleration: u8,
+    ) -> PyResult<(
+        Bound<'py, PyArray2<f64>>,
+        Bound<'py, PyArray1<i64>>,
+        Bound<'py, PyArray1<i64>>,
+    )> {
         let x = x.as_array();
         if x.nrows() != self.n {
             return Err(PyValueError::new_err("incompatible demeaning input"));
+        }
+        if acceleration > 2 {
+            return Err(PyValueError::new_err("unknown demeaning acceleration"));
         }
         let n_columns = x.ncols();
         let mut columns: Vec<Vec<f64>> = (0..n_columns)
@@ -72,11 +98,14 @@ impl HdfePlan {
         let sweep_dimensions: Vec<usize> = (0..self.code_columns.len())
             .chain((0..self.code_columns.len().saturating_sub(1)).rev())
             .collect();
-        let iterations: Vec<i64> = py.allow_threads(|| {
+        let convergence: Vec<(i64, i64)> = py.allow_threads(|| {
             columns
                 .par_iter_mut()
                 .map(|column| {
                     let mut previous = vec![0.0; self.n];
+                    let mut older = column.clone();
+                    let mut candidate = vec![0.0; self.n];
+                    let mut accepted = 0i64;
                     let mut sums: Vec<Vec<f64>> = self
                         .group_counts
                         .iter()
@@ -95,24 +124,67 @@ impl HdfePlan {
                                     / self.group_sizes[dimension][group] as f64;
                             }
                         }
+                        if acceleration != 0 && iteration >= 2 && iteration % 3 == 0 {
+                            let mut numerator = 0.0;
+                            let mut denominator = 0.0;
+                            for row in 0..self.n {
+                                let first = previous[row] - older[row];
+                                let next = column[row] - previous[row];
+                                let second = next - first;
+                                numerator += if acceleration == 2 {
+                                    next * second
+                                } else {
+                                    first * second
+                                };
+                                denominator += second * second;
+                            }
+                            if denominator > f64::EPSILON {
+                                let factor = numerator / denominator;
+                                for row in 0..self.n {
+                                    candidate[row] = if acceleration == 2 {
+                                        column[row] - factor * (column[row] - previous[row])
+                                    } else {
+                                        older[row] - factor * (previous[row] - older[row])
+                                    };
+                                }
+                                if candidate.iter().all(|value| value.is_finite())
+                                    && projection_error(
+                                        &candidate,
+                                        &self.code_columns,
+                                        &self.group_sizes,
+                                    ) < projection_error(
+                                        column,
+                                        &self.code_columns,
+                                        &self.group_sizes,
+                                    )
+                                {
+                                    column.copy_from_slice(&candidate);
+                                    accepted += 1;
+                                }
+                            }
+                        }
                         if column
                             .iter()
                             .zip(previous.iter())
                             .all(|(a, b)| (a - b).abs() < tol)
                         {
-                            return iteration as i64;
+                            return (iteration as i64, accepted);
                         }
+                        older.copy_from_slice(&previous);
                     }
-                    -1
+                    (-1, accepted)
                 })
                 .collect()
         });
+        let iterations: Vec<i64> = convergence.iter().map(|item| item.0).collect();
+        let accepted: Vec<i64> = convergence.iter().map(|item| item.1).collect();
         let flat: Vec<f64> = columns.into_iter().flatten().collect();
         let output = numpy::ndarray::Array2::from_shape_vec((self.n, n_columns).f(), flat)
             .map_err(|_| PyValueError::new_err("could not shape output"))?;
         Ok((
             PyArray2::from_owned_array_bound(py, output),
             PyArray1::from_vec_bound(py, iterations),
+            PyArray1::from_vec_bound(py, accepted),
         ))
     }
 }
@@ -125,9 +197,14 @@ fn demean_map<'py>(
     group_counts: Vec<usize>,
     tol: f64,
     max_iter: usize,
-) -> PyResult<(Bound<'py, PyArray2<f64>>, Bound<'py, PyArray1<i64>>)> {
+    acceleration: u8,
+) -> PyResult<(
+    Bound<'py, PyArray2<f64>>,
+    Bound<'py, PyArray1<i64>>,
+    Bound<'py, PyArray1<i64>>,
+)> {
     let plan = HdfePlan::new(codes, group_counts)?;
-    plan.transform(py, x, tol, max_iter)
+    plan.transform(py, x, tol, max_iter, acceleration)
 }
 
 /// Accumulate one cluster-score meat matrix per residual column.
@@ -195,10 +272,86 @@ fn cluster_meat<'py>(
     Ok(PyArray3::from_owned_array_bound(py, output))
 }
 
+/// Exact within transformation for a dense, balanced unit-by-time panel.
+#[pyfunction]
+fn demean_balanced<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray2<'py, f64>,
+    n_units: usize,
+    n_periods: usize,
+    unit_effect: bool,
+    time_effect: bool,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let x = x.as_array();
+    if n_units * n_periods != x.nrows() || (!unit_effect && !time_effect) {
+        return Err(PyValueError::new_err(
+            "incompatible balanced-panel demeaning inputs",
+        ));
+    }
+    let n_columns = x.ncols();
+    let columns: Vec<Vec<f64>> = py.allow_threads(|| {
+        (0..n_columns)
+            .into_par_iter()
+            .map(|column| {
+                let mut output: Vec<f64> = (0..x.nrows()).map(|row| x[(row, column)]).collect();
+                let grand = if unit_effect && time_effect {
+                    output.iter().sum::<f64>() / output.len() as f64
+                } else {
+                    0.0
+                };
+                let unit_means: Vec<f64> = if unit_effect {
+                    (0..n_units)
+                        .map(|unit| {
+                            output[unit * n_periods..(unit + 1) * n_periods]
+                                .iter()
+                                .sum::<f64>()
+                                / n_periods as f64
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let time_means: Vec<f64> = if time_effect {
+                    (0..n_periods)
+                        .map(|period| {
+                            (0..n_units)
+                                .map(|unit| output[unit * n_periods + period])
+                                .sum::<f64>()
+                                / n_units as f64
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                for unit in 0..n_units {
+                    for period in 0..n_periods {
+                        let index = unit * n_periods + period;
+                        if unit_effect {
+                            output[index] -= unit_means[unit];
+                        }
+                        if time_effect {
+                            output[index] -= time_means[period];
+                        }
+                        if unit_effect && time_effect {
+                            output[index] += grand;
+                        }
+                    }
+                }
+                output
+            })
+            .collect()
+    });
+    let flat: Vec<f64> = columns.into_iter().flatten().collect();
+    let output = numpy::ndarray::Array2::from_shape_vec((x.nrows(), n_columns).f(), flat)
+        .map_err(|_| PyValueError::new_err("could not shape balanced demeaned output"))?;
+    Ok(PyArray2::from_owned_array_bound(py, output))
+}
+
 #[pymodule]
 fn _fastlp_rust(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<HdfePlan>()?;
     module.add_function(wrap_pyfunction!(demean_map, module)?)?;
     module.add_function(wrap_pyfunction!(cluster_meat, module)?)?;
+    module.add_function(wrap_pyfunction!(demean_balanced, module)?)?;
     Ok(())
 }

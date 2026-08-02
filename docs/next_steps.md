@@ -87,11 +87,13 @@ and solve every horizon against that cached design. This avoids the principal
 redundancy in a naive local-projection loop.
 
 The current implementation is nevertheless an early performance baseline, not
-yet a production-scale HDFE engine. Its point-estimation cache is useful, but
-its memory behavior and fixed-effect residualizer need substantial work before
-claiming parity with mature implementations such as `fixest` or `reghdfe`.
+yet a production-scale general HDFE engine. It now has a specialized balanced-
+panel path with arithmetic lead construction, exact unit/time demeaning,
+bounded horizon batches, and optional residual retention. Arbitrary unbalanced
+multiway FE problems still need substantial work before claiming parity with
+mature implementations such as `fixest` or `reghdfe`.
 
-## Memory Management: Current Rating 3/10
+## Memory Management: Current Rating 6/10
 
 ### What the implementation does well
 
@@ -112,10 +114,10 @@ The fit path creates several full-size representations of the data:
 7. residual matrix; and
 8. FE-code matrices and Rust working/output buffers.
 
-The Rust kernel currently owns a separate column buffer and a separate output
-matrix. It does not residualize user-provided arrays in place. The Python engine
-also materializes every requested horizon at once. There is no outcome batching,
-streaming, memory mapping, or reusable scratch allocation.
+The Rust kernels still own separate input/output column buffers and pandas
+preparation can create large copies. Outcome work is now batched under an
+optional memory budget, and residual retention can be disabled, but input
+streaming and memory mapping are not implemented.
 
 For the notebook's 10 million-row configuration with fixed effects and two
 horizons, peak memory will likely be several GiB. Exact usage depends on pandas,
@@ -125,17 +127,15 @@ may struggle.
 
 ### Priority memory work
 
-1. **Batch horizons.** Build, residualize, solve, and release a bounded group
-   of outcome horizons at a time. Retain only coefficient, covariance, and
-   diagnostic outputs.
-2. **Remove avoidable pandas copies.** Validate already-sorted data where
+1. **Remove avoidable pandas copies.** Validate already-sorted data where
    possible; use array views/contiguous arrays after one controlled conversion
    rather than keeping multiple DataFrame copies alive.
-3. **Prepare fixed effects once.** Introduce an internal residualizer object
-   that owns immutable codes/group counts and reuses per-worker scratch buffers.
-4. **Measure peak RSS.** Record peak resident memory for every benchmark case,
+2. **Measure production-scale peak RSS.** The harness records process peak RSS;
+   run it for every large benchmark case,
    including outcome construction, demeaning, linear algebra, and covariance.
-5. **Consider memory-mapped outputs.** For very large horizon grids, allow
+3. **Stream input arrays.** Avoid the full future-position matrix on general
+   unbalanced panels and consider Arrow-style or memory-mapped inputs.
+4. **Consider memory-mapped outputs.** For very large horizon grids, allow
    temporary outcome/residual batches to be backed by disk rather than RAM.
 
 ## Processor Efficiency: Current Rating 5/10 Overall
@@ -155,8 +155,10 @@ large multi-FE workloads.
 
 ### Current bottlenecks
 
-- Multi-way FEs use unaccelerated alternating projections. There is no graph
-  reduction, singleton pruning, warm start, Krylov solver, or preconditioner.
+- Unbalanced multi-way FEs use guarded Irons--Tuck-accelerated alternating
+  projections. Balanced unit/time FEs and arbitrary one-way FEs use exact
+  transforms, and singleton observations are recursively pruned. There is still
+  no graph reduction, Krylov solver, or preconditioner.
 - The Rust kernel reconstructs FE code vectors for each residualization call.
 - It allocates a previous-value vector and group sums/counts during each
   iteration, rather than reusing thread-local buffers.
@@ -179,9 +181,9 @@ large multi-FE workloads.
    policy for Rayon and BLAS.
 4. **Move cluster scores native.** Implement grouped score accumulation in Rust
    and parallelize independent horizon score calculations.
-5. **Evaluate stronger HDFE algorithms.** Benchmark accelerated symmetric MAP,
-   warm starts, singleton removal, and eventually LSMR/LSQR or graph-based
-   approaches against the existing kernel.
+5. **Evaluate stronger HDFE algorithms.** Benchmark guarded Irons--Tuck and
+   Aitken, and eventually evaluate LSMR/LSQR or graph-based approaches against
+   unaccelerated symmetric MAP.
 
 ## Benchmark Plan
 
