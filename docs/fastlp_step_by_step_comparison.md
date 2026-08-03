@@ -171,8 +171,10 @@ The residualization policy specializes before invoking an iterative solver:
 - balanced unit, time, or unit-and-time FEs use exact dense-panel formulas;
 - other multiway FE structures use alternating group projections.
 
-For the general path, the Rust backend uses symmetric Kaczmarz sweeps and the
-NumPy fallback uses cyclic Kaczmarz sweeps. Both support guarded Irons--Tuck
+For the general path, both backends use alternating group projections. The
+Rust backend applies a symmetric forward-and-reverse sweep over the FE
+dimensions, while the NumPy fallback applies a cyclic forward sweep. Both
+support guarded Irons--Tuck
 acceleration by default, vector Aitken acceleration as an alternative, and an
 unaccelerated reference mode. An extrapolated iterate is accepted only when it
 is finite and reduces the largest remaining absolute FE-group mean. Both
@@ -185,7 +187,7 @@ counts, and accepted acceleration steps.
 
 | Library | Comparison at this stage |
 |---|---|
-| `fastLP` | Exact one-way and balanced unit/time transforms; otherwise symmetric Kaczmarz in Rust or cyclic Kaczmarz in NumPy, with guarded Irons--Tuck by default, optional Aitken, and an unaccelerated reference. |
+| `fastLP` | Exact one-way and balanced unit/time transforms; otherwise symmetric alternating projections in Rust or cyclic alternating projections in NumPy, with guarded Irons--Tuck by default, optional Aitken, and an unaccelerated reference. |
 | `fixest` | Multithreaded C++ demeaning with Irons--Tuck acceleration, weights, and varying slopes. More mature and feature-rich. |
 | `reghdfe` | Most configurable absorber: MAP with several projection transforms and accelerators, plus LSMR/LSQR and preconditioning. |
 | `statsmodels` | No specialized HDFE absorber in the core linear-model path described by the research report. |
@@ -197,19 +199,24 @@ check is absolute rather than scale-relative.
 ## Step 7: check rank and factor the shared design
 
 For each sample-mask group, `fastLP` computes
-`gram = X_tilde.T @ X_tilde`, symmetrizes it, checks numerical rank on
-`X_tilde`, and requires positive residual degrees of freedom. It then performs
-an unpivoted Cholesky factorization. Coefficients are obtained with triangular
-solves; the code does not explicitly invert the coefficient solution. A
-Cholesky-based `bread`, mathematically `(X'X)^{-1}`, is calculated once for
-covariance estimation.
+column norms and scales the residualized design before computing and
+symmetrizing its small Gram matrix. Numerical rank and condition estimates are
+obtained from the eigenvalues of this `K`-by-`K` matrix; no decomposition of
+the full `N`-by-`K` design is used. After requiring positive residual degrees
+of freedom, `fastLP` performs an unpivoted Cholesky factorization. Coefficients
+are obtained with triangular solves and coefficients and covariance matrices
+are mapped back to the original feature units. A Cholesky-based `bread`,
+mathematically `(X'X)^{-1}`, is calculated once for covariance estimation.
 
-Exact detected rank loss causes an error. There is currently no column-dropping
-policy, condition-number threshold, pivoted QR, or SVD fallback.
+Detected numerical rank loss, negligible within variation, and Cholesky
+failure produce contextual errors. Solver diagnostics report rank, the rank
+tolerance, original column norms, and condition estimates for the scaled
+design and Gram matrix. There is currently no column-dropping policy, pivoted
+QR, or SVD fallback.
 
 | Library | Comparison at this stage |
 |---|---|
-| `fastLP` | Cross-products plus unpivoted Cholesky after a rank check; maximizes reuse for modest `K`, but has the narrowest numerical fallback policy. |
+| `fastLP` | Column-scaled cross-products plus unpivoted Cholesky after a small-matrix rank and condition check; maximizes reuse for modest `K`, but has no fallback solver. |
 | `fixest` | Cross-products plus a custom rank-revealing Cholesky that can identify and exclude collinear columns. Architecturally closest to `fastLP` at this stage. |
 | `reghdfe` | Runs the final regression after partialling out and exposes an optional faster normal-equation path; also offers iterative paths for absorption. |
 | `statsmodels` | Moore--Penrose pseudoinverse by default or QR on request, with numerical rank retained. Generally more forgiving of rank deficiency, at additional dense-linear-algebra cost. |
@@ -333,9 +340,9 @@ interfaces.
 | Balanced unit/time transform | Exact one- or two-way formula | General optimized absorber | General optimized absorber | User preprocessing or dummies |
 | Arbitrary multiway HDFE | Yes | Yes | Yes | Not in the cited core OLS path |
 | Compact FE representation | Contiguous `int64` codes | Compact identifiers and group systems | Implicit FE operators in Mata | Dense design in core formula/OLS path |
-| Default iterative transform | Symmetric Kaczmarz in Rust | Package-specific projection algorithm | Symmetric Kaczmarz MAP | Not applicable in core OLS |
+| Default iterative transform | Symmetric alternating projections in Rust | Package-specific projection algorithm | Symmetric Kaczmarz MAP | Not applicable in core OLS |
 | Acceleration | Guarded Irons--Tuck default; Aitken optional | Irons--Tuck with additional tuning strategies | Conjugate gradient default; other accelerators | Not applicable in core OLS |
-| Alternative absorber solvers | Unaccelerated Kaczmarz reference | Tunable projection/acceleration policy | MAP, LSMR, and LSQR | External preprocessing required for HDFE |
+| Alternative absorber solvers | Unaccelerated alternating-projection reference | Tunable projection/acceleration policy | MAP, LSMR, and LSQR | External preprocessing required for HDFE |
 | Preconditioning | No | Internal specialized group systems | None, diagonal, or block diagonal by solver | General SciPy tools, not core HDFE integration |
 | FE reordering | No | Frequency-based reordering available | Solver-specific internal handling | Not applicable |
 | Singleton removal | Recursive by default; explicit `keep` option | Recursive policies | Iterative removal | No HDFE-specific policy in core OLS |
@@ -347,10 +354,10 @@ interfaces.
 | **Numerical linear algebra** |  |  |  |  |
 | Final OLS strategy | Shared `X'X` plus Cholesky | Cross-products plus rank-aware Cholesky | Regression after absorption; optional normal equations | Pseudoinverse default; QR optional |
 | Coefficient-system operation | Cholesky triangular solves; no direct inverse | Cholesky-factor inverse/cross-product machinery | Solver-dependent | Pseudoinverse or QR solve |
-| Rank detection | Numerical rank check before Cholesky | Rank-revealing exclusion | Mature collinearity handling | Numerical rank retained |
+| Rank detection | Scaled `K`-by-`K` Gram eigenvalue check before Cholesky | Rank-revealing exclusion | Mature collinearity handling | Numerical rank retained |
 | Rank-deficient behavior | Raises | Drops/reports collinear columns | Drops/reports omitted variables | Pseudoinverse accommodates rank loss |
 | Ill-conditioning fallback | No QR/SVD fallback | Tolerance-controlled Cholesky policy | Stable/default and faster-riskier paths | Pseudoinverse or QR |
-| Column scaling policy | No | Internal estimator-specific handling | Solver/preconditioner options | User/model-dependent |
+| Column scaling policy | Internal column-norm scaling; results mapped back to original units | Internal estimator-specific handling | Solver/preconditioner options | User/model-dependent |
 | **Covariance and inference** |  |  |  |  |
 | Homoskedastic covariance | Yes | Yes | Yes | Yes |
 | HC0--HC3 | Yes | Broad heteroskedastic options | Robust options through Stata workflow | Yes |
@@ -413,7 +420,7 @@ workflow, `reghdfe` offers the most configurable HDFE solver, and
 Relative to the production blueprint in the research report, the current
 implementation should next prioritize:
 
-1. a conditioning diagnostic and pivoted QR or SVD fallback;
+1. a pivoted QR or SVD fallback for designs rejected by the scaled Cholesky path;
 2. absorbed-FE degrees-of-freedom reporting and FE coefficient recovery;
 3. scale-aware demeaning tolerances and final residual orthogonality checks;
 4. weights, with explicitly documented weight semantics;

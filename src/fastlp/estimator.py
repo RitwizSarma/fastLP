@@ -471,6 +471,7 @@ class LocalProjection:
         cache_group_by_horizon = np.empty(n_horizons, dtype=int)
         x_iterations_by_group: list[np.ndarray] = []
         acceleration_accepted_by_group: list[np.ndarray] = []
+        linear_algebra_by_group: list[dict[str, object]] = []
         backends: list[str] = []
         methods: list[str] = []
         warned_cluster_terms: set[str] = set()
@@ -494,17 +495,71 @@ class LocalProjection:
             else:
                 residualizer = None
                 x_tilde, x_diag = exact_x
-            gram = (x_tilde.T @ x_tilde)
+            column_scales = np.linalg.norm(x_tilde, axis=0)
+            raw_column_scales = np.linalg.norm(x, axis=0)
+            scale_floor = np.sqrt(np.finfo(np.float64).eps) * raw_column_scales
+            weak_columns = (~np.isfinite(column_scales)) | (column_scales <= scale_floor)
+            if weak_columns.any():
+                names = [feature_names[index] for index in np.flatnonzero(weak_columns)]
+                raise ValueError(
+                    f"residualized design has zero or negligible within variation at "
+                    f"horizon {horizons[0]} for columns {names}"
+                )
+
+            # Equilibrate the design before forming cross-products.  All
+            # reported coefficients and covariance matrices are transformed
+            # back to the original feature units below.
+            x_tilde /= column_scales
+            gram = x_tilde.T @ x_tilde
             gram = (gram + gram.T) / 2
-            rank = int(np.linalg.matrix_rank(x_tilde))
+            try:
+                eigenvalues = np.linalg.eigvalsh(gram)
+            except np.linalg.LinAlgError as error:
+                raise ValueError(
+                    f"could not assess the scaled design at horizon {horizons[0]}; "
+                    "the small Gram-matrix eigendecomposition did not converge"
+                ) from error
+            largest_eigenvalue = float(eigenvalues[-1])
+            rank_tolerance = (
+                np.finfo(np.float64).eps * gram.shape[0] * largest_eigenvalue
+            )
+            rank = int(np.count_nonzero(eigenvalues > rank_tolerance))
+            smallest_eigenvalue = float(eigenvalues[0])
+            gram_condition = (
+                largest_eigenvalue / smallest_eigenvalue
+                if smallest_eigenvalue > 0.0
+                else np.inf
+            )
+            design_condition = float(np.sqrt(gram_condition))
+            linear_algebra_by_group.append(
+                {
+                    "horizon": int(horizons[0]),
+                    "rank": rank,
+                    "n_features": int(x_tilde.shape[1]),
+                    "rank_tolerance": float(rank_tolerance),
+                    "scaled_gram_condition_number": float(gram_condition),
+                    "scaled_design_condition_number": design_condition,
+                    "column_scales": column_scales.copy(),
+                }
+            )
             if rank != x_tilde.shape[1]:
-                raise ValueError(f"residualized design is rank deficient at horizon {horizons[0]}")
+                raise ValueError(
+                    f"residualized design is numerically rank deficient at horizon "
+                    f"{horizons[0]} (rank {rank} of {x_tilde.shape[1]}; scaled-design "
+                    f"condition number {design_condition:.3g})"
+                )
             if len(anchor) <= rank:
                 raise ValueError("residual degrees of freedom must be positive")
             try:
                 chol = np.linalg.cholesky(gram)
             except np.linalg.LinAlgError as error:
-                raise ValueError("residualized design is not positive definite") from error
+                raise ValueError(
+                    f"Cholesky factorization of the scaled Gram matrix failed at "
+                    f"horizon {horizons[0]} despite an estimated rank of {rank}; "
+                    f"the residualized design may be ill-conditioned "
+                    f"(estimated scaled-design condition number "
+                    f"{design_condition:.3g})"
+                ) from error
             bread = np.linalg.solve(chol.T, np.linalg.solve(chol, np.eye(rank)))
             cluster_data = None
             if self.covariance == "cluster":
@@ -576,8 +631,10 @@ class LocalProjection:
                         max_iter=self.max_iter,
                         acceleration=self.demean_acceleration,
                     )
-                coef = np.linalg.solve(chol.T, np.linalg.solve(chol, x_tilde.T @ y_tilde))
-                residuals = y_tilde - x_tilde @ coef
+                scaled_coef = np.linalg.solve(
+                    chol.T, np.linalg.solve(chol, x_tilde.T @ y_tilde)
+                )
+                residuals = y_tilde - x_tilde @ scaled_coef
                 if self.covariance == "homoskedastic":
                     covariance = homoskedastic(x_tilde, residuals, bread)
                     covariance_diagnostics = tuple(
@@ -607,10 +664,19 @@ class LocalProjection:
                         max_lags=self.hac_lags, kernel=self.hac_kernel, debias=self.hac_debias,
                         driscoll_kraay=self.covariance == "driscoll_kraay",
                     )
+                inverse_scales = 1.0 / column_scales
+                coef = scaled_coef * inverse_scales[:, None]
+                covariance *= inverse_scales[None, :, None]
+                covariance *= inverse_scales[None, None, :]
                 covariance = (covariance + covariance.transpose(0, 2, 1)) / 2
                 diagonal = np.diagonal(covariance, axis1=1, axis2=2)
-                scale = np.maximum(np.max(np.abs(covariance), axis=(1, 2)), 1.0)
-                materially_negative = diagonal < -np.finfo(float).eps * scale[:, None] * 100
+                covariance_scale = np.maximum(
+                    np.max(np.abs(covariance), axis=(1, 2)), 1.0
+                )
+                materially_negative = (
+                    diagonal
+                    < -np.finfo(float).eps * covariance_scale[:, None] * 100
+                )
                 if materially_negative.any():
                     local_horizon, feature = np.argwhere(materially_negative)[0]
                     raise ValueError(
@@ -675,6 +741,10 @@ class LocalProjection:
             "policy": self.singleton_policy,
             "dropped_by_horizon": singleton_dropped,
             "rounds_by_horizon": singleton_rounds,
+        }
+        self.linear_algebra_diagnostics_ = {
+            "solver": "scaled_cholesky",
+            "by_cache_group": tuple(linear_algebra_by_group),
         }
         self._irfplot = None
         self.demeaning_diagnostics_ = {

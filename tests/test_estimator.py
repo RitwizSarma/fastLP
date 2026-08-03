@@ -42,6 +42,8 @@ def test_cached_no_fe_matches_separate_ols() -> None:
 
 def test_fixed_effects_remove_intercept_and_converge() -> None:
     data = balanced_panel()
+    data["shock"] += 0.03 * data["unit"] * data["time"]
+    data["control"] += 0.01 * data["unit"] * data["time"] ** 2
     fitted = LocalProjection(horizons=1, covariance="cluster").fit(
         data,
         outcome="y",
@@ -59,6 +61,98 @@ def test_fixed_effects_remove_intercept_and_converge() -> None:
     }
     assert np.all(fitted.demeaning_diagnostics_["x_iterations"] > 0)
     assert fitted.covariance_.shape == (2, 2, 2)
+
+
+def test_scaled_cholesky_preserves_original_feature_units() -> None:
+    data = covariance_panel()
+    baseline = LocalProjection(horizons=2, covariance="hc1").fit(
+        data,
+        outcome="y",
+        shock="shock",
+        controls=["control"],
+        unit="unit",
+        time="time",
+    )
+    rescaled = data.copy()
+    rescaled["shock"] *= 1e9
+    rescaled["control"] *= 1e-9
+    fitted = LocalProjection(horizons=2, covariance="hc1").fit(
+        rescaled,
+        outcome="y",
+        shock="shock",
+        controls=["control"],
+        unit="unit",
+        time="time",
+    )
+
+    coefficient_map = np.diag([1.0, 1e9, 1e-9])
+    np.testing.assert_allclose(
+        fitted.coef_ @ coefficient_map,
+        baseline.coef_,
+        rtol=1e-10,
+        atol=1e-10,
+    )
+    for horizon in range(3):
+        np.testing.assert_allclose(
+            coefficient_map @ fitted.covariance_[horizon] @ coefficient_map,
+            baseline.covariance_[horizon],
+            rtol=1e-9,
+            atol=1e-10,
+        )
+    diagnostics = fitted.linear_algebra_diagnostics_
+    assert diagnostics["solver"] == "scaled_cholesky"
+    group = diagnostics["by_cache_group"][0]
+    assert group["rank"] == 3
+    assert np.isfinite(group["scaled_design_condition_number"])
+    assert group["column_scales"][1] > group["column_scales"][2] * 1e15
+
+
+def test_scaled_cholesky_reports_absorbed_and_collinear_designs() -> None:
+    absorbed = balanced_panel()
+    with pytest.raises(ValueError, match="negligible within variation.*shock"):
+        LocalProjection(horizons=0, covariance="hc1").fit(
+            absorbed,
+            outcome="y",
+            shock="shock",
+            unit="unit",
+            time="time",
+            fixed_effects=["unit", "time"],
+        )
+
+    collinear = covariance_panel().copy()
+    collinear["duplicate"] = collinear["shock"]
+    with pytest.raises(ValueError, match="numerically rank deficient.*rank 2 of 3"):
+        LocalProjection(horizons=0, covariance="hc1").fit(
+            collinear,
+            outcome="y",
+            shock="shock",
+            controls=["duplicate"],
+            unit="unit",
+            time="time",
+        )
+
+
+def test_cholesky_failure_reports_horizon_and_condition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import fastlp.estimator as estimator
+
+    def fail_cholesky(unused: np.ndarray) -> np.ndarray:
+        raise np.linalg.LinAlgError("forced failure")
+
+    monkeypatch.setattr(estimator.np.linalg, "cholesky", fail_cholesky)
+    with pytest.raises(
+        ValueError,
+        match="Cholesky factorization.*horizon 0.*condition number",
+    ):
+        LocalProjection(horizons=0, covariance="hc1").fit(
+            covariance_panel(),
+            outcome="y",
+            shock="shock",
+            controls=["control"],
+            unit="unit",
+            time="time",
+        )
 
 
 def test_prepared_residualizer_reuses_topology_and_matches_group_projection() -> None:

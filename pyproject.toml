@@ -4,10 +4,12 @@ version = "0.1.0"
 description = "Fast local projections for balanced and unbalanced panel data"
 readme = "README.md"
 requires-python = ">=3.12"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE", "LICENSES/*.txt"]
 dependencies = [
-    "matplotlib>=3.11.1",
-    "numpy>=2.5.1",
-    "pandas>=3.0.3",
+    "matplotlib>=3.9",
+    "numpy>=2.0",
+    "pandas>=2.2",
 ]
 
 [build-system]
@@ -22,6 +24,8 @@ bindings = "pyo3"
 strip = true
 include = [
     { path = "rust/Cargo.lock", format = "sdist" },
+    { path = "LICENSE", format = "sdist" },
+    { path = "LICENSES/diff-diff-MIT.txt", format = "sdist" },
 ]
 
 [dependency-groups]

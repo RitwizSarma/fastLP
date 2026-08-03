@@ -16,7 +16,7 @@ import gc
 import json
 import pstats
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -96,11 +96,37 @@ def _agreement(fitted: LocalProjection, reference: Any, atol: float, rtol: float
     }
 
 
+def _stage_medians(measurements: list[Measurement]) -> dict[str, dict[str, float | None]]:
+    """Return per-stage medians for every clock recorded by ``measure``."""
+    stages = sorted({stage for measurement in measurements for stage in measurement.stages})
+    result: dict[str, dict[str, float | None]] = {}
+    for stage in stages:
+        values = [measurement.stages.get(stage) for measurement in measurements]
+        present = [value for value in values if value is not None]
+        wall = float(np.median([value.wall_seconds for value in present]))
+        user = float(np.median([value.user_seconds for value in present]))
+        system = float(np.median([value.system_seconds for value in present]))
+        cpu = user + system
+        result[stage] = {
+            "wall_seconds": wall,
+            "user_seconds": user,
+            "system_seconds": system,
+            "cpu_seconds": cpu,
+            "cpu_utilization_percent": 100 * cpu / wall if wall else None,
+        }
+    return result
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--scenario", choices=SCENARIOS, default="smoke", help="deterministic generated design")
     source.add_argument("--csv", type=Path, help="existing panel CSV; reading happens before measurement")
+    parser.add_argument("--n-units", type=int, help="override a generated scenario's number of panel units")
+    parser.add_argument("--n-periods", type=int, help="override a generated scenario's number of periods per unit")
+    parser.add_argument("--n-controls", type=int, help="override a generated scenario's number of controls")
+    parser.add_argument("--unbalanced-share", type=float, help="override a generated scenario's missing-row share")
+    parser.add_argument("--seed", type=int, help="override a generated scenario's random seed")
     parser.add_argument("--horizons", type=int, help="override a scenario's horizon count")
     parser.add_argument("--repetitions", type=int, default=3, help="measured fits (default: 3)")
     parser.add_argument("--warmups", type=int, default=1, help="unreported warm-up fits (default: 1)")
@@ -128,6 +154,17 @@ def parse_args() -> argparse.Namespace:
         parser.error("repetitions must be at least one and warmups cannot be negative")
     if arguments.threads is not None and arguments.threads < 1:
         parser.error("threads must be at least one")
+    if any(value is not None for value in (arguments.n_units, arguments.n_periods, arguments.n_controls, arguments.unbalanced_share, arguments.seed)):
+        if arguments.csv:
+            parser.error("generated-panel overrides cannot be combined with --csv")
+        if arguments.n_units is not None and arguments.n_units < 1:
+            parser.error("--n-units must be positive")
+        if arguments.n_periods is not None and arguments.n_periods < 2:
+            parser.error("--n-periods must be at least two")
+        if arguments.n_controls is not None and arguments.n_controls < 0:
+            parser.error("--n-controls cannot be negative")
+        if arguments.unbalanced_share is not None and not 0 <= arguments.unbalanced_share < 1:
+            parser.error("--unbalanced-share must be in [0, 1)")
     return arguments
 
 
@@ -143,6 +180,19 @@ def main() -> None:
         horizons = args.horizons
     else:
         scenario = SCENARIOS[args.scenario]
+        overrides = {
+            name: value
+            for name, value in {
+                "n_units": args.n_units,
+                "n_periods": args.n_periods,
+                "n_controls": args.n_controls,
+                "unbalanced_share": args.unbalanced_share,
+                "seed": args.seed,
+            }.items()
+            if value is not None
+        }
+        if overrides:
+            scenario = replace(scenario, name="custom", **overrides)
         data = make_panel(scenario)
         source = {"kind": "generated", **scenario.metadata()}
         horizons = args.horizons if args.horizons is not None else scenario.horizons
@@ -221,8 +271,29 @@ def main() -> None:
     observation_rows = []
     stage_rows = []
     for index, result in enumerate(measurements, start=1):
-        observation_rows.append({"run": index, **asdict(result), "stages_seconds": json.dumps(result.stages_seconds, sort_keys=True)})
-        stage_rows.extend({"run": index, "stage": stage, "seconds": seconds} for stage, seconds in result.stages_seconds.items())
+        serialized = asdict(result)
+        stages = serialized.pop("stages")
+        observation_rows.append(
+            {
+                "run": index,
+                **serialized,
+                "stages_seconds": json.dumps(result.stages_seconds, sort_keys=True),
+                "stages": json.dumps(stages, sort_keys=True),
+            }
+        )
+        for stage, timing in result.stages.items():
+            stage_rows.append(
+                {
+                    "run": index,
+                    "stage": stage,
+                    "wall_seconds": timing.wall_seconds,
+                    "user_seconds": timing.user_seconds,
+                    "system_seconds": timing.system_seconds,
+                    "cpu_seconds": timing.cpu_seconds,
+                    "cpu_utilization_percent": timing.cpu_utilization_percent,
+                }
+            )
+    stages_median = _stage_medians(measurements)
     summary = {
         "run_id": run_id,
         "source": source,
@@ -245,14 +316,10 @@ def main() -> None:
                 default=None,
             )
         },
-        "stages_seconds_median": {
-            stage: float(
-                np.median([item.stages_seconds.get(stage, 0.0) for item in measurements])
-            )
-            for stage in sorted(
-                {stage for item in measurements for stage in item.stages_seconds}
-            )
-        },
+        # Keep this wall-only key for existing dashboards while exposing all
+        # three clocks below.
+        "stages_seconds_median": {stage: values["wall_seconds"] for stage, values in stages_median.items()},
+        "stages_median": stages_median,
         "agreement": agreement,
     }
     if baseline is not None:
@@ -262,7 +329,10 @@ def main() -> None:
     _write_csv(output / "observations.csv", observation_rows)
     _write_csv(output / "stages.csv", stage_rows)
     if not stage_rows:
-        (output / "stages.csv").write_text("run,stage,seconds\n", encoding="utf-8")
+        (output / "stages.csv").write_text(
+            "run,stage,wall_seconds,user_seconds,system_seconds,cpu_seconds,cpu_utilization_percent\n",
+            encoding="utf-8",
+        )
     print(f"Results: {output}")
     print(f"fastLP median fit: {summary['wall_seconds']['median']:.6f} s ({args.repetitions} measured run(s))")
     if agreement.get("available"):
