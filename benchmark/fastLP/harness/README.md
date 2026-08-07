@@ -16,6 +16,12 @@ uv run python benchmark/fastLP/harness/runner.py --scenario small --repetitions 
 # Reuse the existing CSV data; loading remains outside the reported fit time
 uv run python benchmark/fastLP/harness/runner.py --csv benchmark/data/small_balanced.csv --horizons 12 --profile
 
+# Use Polars input or a Parquet source; loading remains outside the fit timer
+uv run --extra polars python benchmark/fastLP/harness/runner.py \
+  --csv benchmark/data/small_balanced.csv --horizons 12 --backend polars
+uv run python benchmark/fastLP/harness/runner.py \
+  --parquet benchmark/data/small_balanced.parquet --horizons 12 --backend pandas
+
 # Vary N (rows, via units x periods) and K (shock plus controls) in fresh processes
 uv run python benchmark/fastLP/harness/grid.py \
   --n-units 312,1250,5000 --n-controls 1,8,32 \
@@ -58,11 +64,17 @@ combination), `stages.csv` (one median stage row per combination), and the
 per-case harness artifacts. In this harness N is the realized row count and K
 is the number of regressors after adding the shock (and before fixed effects).
 
-When using `--csv`, always supply `--horizons`: the correct value cannot be
-derived safely from an arbitrary file. Use `--threads N` to set one coordinated `RAYON_NUM_THREADS`,
+When using `--csv` or `--parquet`, always supply `--horizons`: the correct value
+cannot be derived safely from an arbitrary file. File loading remains outside
+the measured fit boundary; the input backend and format are recorded in
+`summary.json`. Use `--threads N` to set one coordinated `RAYON_NUM_THREADS`,
 `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, and `OMP_NUM_THREADS` policy for a
 run. This makes oversubscription experiments reproducible. The chosen policy
 and any existing thread settings are stored in `summary.json`.
+
+Pandas Parquet input requires a pandas-compatible Parquet engine such as
+PyArrow. Polars Parquet input is available through the `polars` extra without
+an additional PyArrow dependency.
 
 Use `--response cumulative` to exercise cumulative responses,
 `--memory-budget 4GB` to test adaptive horizon batching, and

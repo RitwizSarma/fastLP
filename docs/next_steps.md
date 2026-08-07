@@ -1,5 +1,9 @@
 # fastLP Next Steps
 
+## Basic and obvious features
+
+1. `numpy` arrays as input. Duh.
+
 ## Inference: broaden error calculations without narrowing LP specifications
 
 The estimator now provides classical, HC0--HC3, one- through four-way CR0/CR1
@@ -7,7 +11,7 @@ clustered, within-unit Newey--West HAC, and Driscoll--Kraay covariance, all
 with normal critical values. LP users still need a broader inference menu over
 time, because few clusters and nonstandard sampling distributions are common.
 
-Priority additions are:
+Possible additions are:
 
 1. **Bootstrap and leverage-adjusted clustering.** Add CR2/CR3, wild-cluster,
    and bootstrap procedures for applications with few clusters or nonstandard

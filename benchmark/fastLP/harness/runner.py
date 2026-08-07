@@ -48,30 +48,55 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
-def _controls(data: pd.DataFrame) -> tuple[str, ...]:
+def _controls(data: Any) -> tuple[str, ...]:
     controls = [column for column in data.columns if column == "control" or column.startswith("control_")]
     return tuple(sorted(controls))
 
 
-def _balanced(data: pd.DataFrame) -> bool:
+def _column_array(data: Any, column: str) -> np.ndarray:
+    if isinstance(data, pd.DataFrame):
+        return data[column].to_numpy()
+    return data.get_column(column).to_numpy()
+
+
+def _balanced(data: Any) -> bool:
     # Exact label sequences, rather than merely equal row counts, match fastLP's
     # definition of a balanced panel.
-    sequences = data.sort_values(["unit", "time"], kind="stable").groupby("unit", sort=False)["time"]
-    first: tuple[object, ...] | None = None
-    for _, labels in sequences:
-        current = tuple(labels.tolist())
-        if first is None:
-            first = current
-        elif current != first:
-            return False
-    return first is not None
+    unit = _column_array(data, "unit")
+    time = _column_array(data, "time")
+    if not len(unit):
+        return False
+    order = np.lexsort((time, unit))
+    unit = unit[order]
+    time = time[order]
+    starts = np.flatnonzero(np.r_[True, unit[1:] != unit[:-1]])
+    sizes = np.diff(np.r_[starts, len(unit)])
+    if not np.all(sizes == sizes[0]):
+        return False
+    labels = time.reshape(len(starts), int(sizes[0]))
+    return bool(np.all(labels == labels[0]))
 
 
-def _dimensions(data: pd.DataFrame, horizons: int, fixed_effects: tuple[str, ...], controls: tuple[str, ...]) -> dict[str, Any]:
+def _as_pandas(data: Any) -> pd.DataFrame:
+    """Create a small/reference pandas view without requiring PyArrow."""
+    if isinstance(data, pd.DataFrame):
+        return data
+    return pd.DataFrame({column: data.get_column(column).to_numpy() for column in data.columns})
+
+
+def _as_polars(data: pd.DataFrame) -> Any:
+    try:
+        import polars as pl
+    except ImportError as error:
+        raise SystemExit("--backend polars requires: uv run --extra polars ...") from error
+    return pl.DataFrame({column: data[column].to_numpy() for column in data.columns})
+
+
+def _dimensions(data: Any, horizons: int, fixed_effects: tuple[str, ...], controls: tuple[str, ...]) -> dict[str, Any]:
     return {
         "n_rows": len(data),
-        "n_units": int(data["unit"].nunique()),
-        "n_periods": int(data["time"].nunique()),
+        "n_units": int(len(np.unique(_column_array(data, "unit")))),
+        "n_periods": int(len(np.unique(_column_array(data, "time")))),
         "horizons": horizons,
         "n_horizons": horizons + 1,
         "n_regressors": 1 + len(controls),
@@ -122,6 +147,8 @@ def parse_args() -> argparse.Namespace:
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--scenario", choices=SCENARIOS, default="smoke", help="deterministic generated design")
     source.add_argument("--csv", type=Path, help="existing panel CSV; reading happens before measurement")
+    source.add_argument("--parquet", type=Path, help="existing panel Parquet file; reading happens before measurement")
+    parser.add_argument("--backend", choices=("pandas", "polars"), default="pandas")
     parser.add_argument("--n-units", type=int, help="override a generated scenario's number of panel units")
     parser.add_argument("--n-periods", type=int, help="override a generated scenario's number of periods per unit")
     parser.add_argument("--n-controls", type=int, help="override a generated scenario's number of controls")
@@ -155,8 +182,8 @@ def parse_args() -> argparse.Namespace:
     if arguments.threads is not None and arguments.threads < 1:
         parser.error("threads must be at least one")
     if any(value is not None for value in (arguments.n_units, arguments.n_periods, arguments.n_controls, arguments.unbalanced_share, arguments.seed)):
-        if arguments.csv:
-            parser.error("generated-panel overrides cannot be combined with --csv")
+        if arguments.csv or arguments.parquet:
+            parser.error("generated-panel overrides cannot be combined with file input")
         if arguments.n_units is not None and arguments.n_units < 1:
             parser.error("--n-units must be positive")
         if arguments.n_periods is not None and arguments.n_periods < 2:
@@ -170,13 +197,31 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.csv:
-        if not args.csv.is_file():
-            raise SystemExit(f"CSV not found: {args.csv}")
+    input_path = args.csv or args.parquet
+    if input_path:
+        if not input_path.is_file():
+            raise SystemExit(f"input file not found: {input_path}")
         if args.horizons is None:
-            raise SystemExit("--horizons is required with --csv (it cannot be inferred safely)")
-        data = pd.read_csv(args.csv)
-        source: dict[str, Any] = {"kind": "csv", "path": str(args.csv.resolve())}
+            raise SystemExit("--horizons is required with file input (it cannot be inferred safely)")
+        file_format = "csv" if args.csv else "parquet"
+        if args.backend == "pandas":
+            try:
+                data = pd.read_csv(input_path) if args.csv else pd.read_parquet(input_path)
+            except ImportError as error:
+                raise SystemExit(
+                    "pandas Parquet input requires a pandas Parquet engine such as pyarrow"
+                ) from error
+        else:
+            try:
+                import polars as pl
+            except ImportError as error:
+                raise SystemExit("--backend polars requires: uv run --extra polars ...") from error
+            data = pl.read_csv(input_path) if args.csv else pl.read_parquet(input_path)
+        source = {
+            "kind": file_format,
+            "path": str(input_path.resolve()),
+            "backend": args.backend,
+        }
         horizons = args.horizons
     else:
         scenario = SCENARIOS[args.scenario]
@@ -194,7 +239,10 @@ def main() -> None:
         if overrides:
             scenario = replace(scenario, name="custom", **overrides)
         data = make_panel(scenario)
+        if args.backend == "polars":
+            data = _as_polars(data)
         source = {"kind": "generated", **scenario.metadata()}
+        source["backend"] = args.backend
         horizons = args.horizons if args.horizons is not None else scenario.horizons
     required = {"unit", "time", "outcome", "shock"}
     missing = sorted(required.difference(data.columns))
@@ -242,8 +290,9 @@ def main() -> None:
         agreement: dict[str, Any]
         if args.validate or args.baseline:
             if balanced and args.response == "level" and args.covariance in {"cluster", "hc1"}:
+                reference_data = _as_pandas(data)
                 reference_call = lambda: fit_independent_horizons(
-                    data, horizons=horizons, covariance=args.covariance, fixed_effects=effects, cluster=cluster, controls=controls
+                    reference_data, horizons=horizons, covariance=args.covariance, fixed_effects=effects, cluster=cluster, controls=controls
                 )
                 if args.baseline:
                     baseline = measure(reference_call, stage_timing=False)
@@ -306,6 +355,7 @@ def main() -> None:
             "response": args.response,
             "memory_budget": args.memory_budget,
             "retain_residuals": not args.discard_residuals,
+            "input_backend": args.backend,
             "warmups": args.warmups,
             "repetitions": args.repetitions,
         },

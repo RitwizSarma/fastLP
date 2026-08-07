@@ -12,6 +12,9 @@ dependencies = [
     "pandas>=2.2",
 ]
 
+[project.optional-dependencies]
+polars = ["polars>=1.43"]
+
 [build-system]
 requires = ["maturin>=1.7,<2"]
 build-backend = "maturin"

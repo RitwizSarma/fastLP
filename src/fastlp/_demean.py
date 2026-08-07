@@ -164,14 +164,22 @@ def factorize_effects(frame, columns: tuple[str, ...]) -> tuple[np.ndarray, np.n
     if not columns:
         return np.empty((len(frame), 0), dtype=np.int64), np.empty(0, dtype=np.int64)
 
+    factorize = getattr(frame, "factorize", None)
+    if not callable(factorize):
+        factorize = None
+
     codes = np.empty((len(frame), len(columns)), dtype=np.int64)
     counts = np.empty(len(columns), dtype=np.int64)
     for index, column in enumerate(columns):
-        encoded, uniques = __import__("pandas").factorize(frame[column], sort=True)
+        if factorize is None:
+            encoded, categories = __import__("pandas").factorize(frame[column], sort=True)
+            n_groups = len(categories)
+        else:
+            encoded, n_groups = factorize((column,))
         if (encoded < 0).any():
             raise ValueError(f"fixed-effect column {column!r} contains missing values")
         codes[:, index] = encoded
-        counts[index] = len(uniques)
+        counts[index] = n_groups
     return codes, counts
 
 

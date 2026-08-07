@@ -63,20 +63,15 @@ def hc1(x: np.ndarray, residuals: np.ndarray, bread: np.ndarray) -> np.ndarray:
     return hc(x, residuals, bread, "hc1")
 
 
-def factorize_cluster_terms(
-    frame: pd.DataFrame, terms: tuple[tuple[str, ...], ...]
-) -> tuple[list[np.ndarray], list[str]]:
+def factorize_cluster_terms(frame, terms: tuple[tuple[str, ...], ...]) -> tuple[list[np.ndarray], list[str]]:
     """Factorize categorical cluster terms, including interaction terms."""
     codes: list[np.ndarray] = []
     labels: list[str] = []
     for term in terms:
-        if len(term) == 1:
-            encoded, categories = pd.factorize(frame[term[0]], sort=True)
-        else:
-            encoded, categories = pd.factorize(pd.MultiIndex.from_frame(frame.loc[:, list(term)]), sort=True)
+        encoded, n_categories = frame.factorize(term)
         if (encoded < 0).any():
             raise ValueError(f"cluster term {'#'.join(term)!r} contains missing values")
-        if len(categories) < 2:
+        if n_categories < 2:
             raise ValueError(f"cluster term {'#'.join(term)!r} requires at least two clusters")
         codes.append(np.asarray(encoded, dtype=np.int64))
         labels.append("#".join(term))
@@ -179,9 +174,9 @@ def _kernel_weight(kernel: Kernel, lag: int, bandwidth: int) -> float:
     return 25.0 / (12.0 * pi**2 * ratio**2) * (sin(z) / z - cos(z))
 
 
-def _integer_time(values: pd.Series) -> np.ndarray:
+def _integer_time(values: np.ndarray) -> np.ndarray:
     try:
-        numeric = pd.to_numeric(values, errors="raise").to_numpy(dtype=np.float64)
+        numeric = np.asarray(values).astype(np.float64)
     except (TypeError, ValueError) as error:
         raise ValueError("HAC and Driscoll-Kraay require numeric integral time labels") from error
     if not np.isfinite(numeric).all() or not np.allclose(numeric, np.rint(numeric)):
@@ -189,13 +184,13 @@ def _integer_time(values: pd.Series) -> np.ndarray:
     return np.rint(numeric).astype(np.int64)
 
 
-def _lag_pairs(unit: pd.Series | None, time: np.ndarray, max_lag: int) -> tuple[tuple[np.ndarray, np.ndarray], ...]:
+def _lag_pairs(unit: np.ndarray | None, time: np.ndarray, max_lag: int) -> tuple[tuple[np.ndarray, np.ndarray], ...]:
     """Return current/lagged row positions for exact calendar lags."""
     if unit is None:
         keys = {(int(t),): index for index, t in enumerate(time)}
         prefix = lambda index: ()  # noqa: E731
     else:
-        unit_codes, _ = pd.factorize(unit, sort=True)
+        unit_codes, _ = pd.factorize(np.asarray(unit), sort=True)
         keys = {(int(unit_codes[index]), int(t)): index for index, t in enumerate(time)}
         prefix = lambda index: (int(unit_codes[index]),)  # noqa: E731
     pairs: list[tuple[np.ndarray, np.ndarray]] = []
@@ -234,8 +229,8 @@ def _hac_meat(scores: np.ndarray, pairs: tuple[tuple[np.ndarray, np.ndarray], ..
 def hac(
     x: np.ndarray,
     residuals: np.ndarray,
-    unit: pd.Series,
-    time: pd.Series,
+    unit: np.ndarray,
+    time: np.ndarray,
     horizons: Sequence[int],
     bread: np.ndarray,
     *,

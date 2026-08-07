@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from numbers import Integral
 from statistics import NormalDist
+from typing import Any
 import warnings
 
 import numpy as np
@@ -19,6 +20,7 @@ from ._covariance import (
     homoskedastic,
 )
 from ._demean import DemeanDiagnostics, Residualizer, balanced_demean, factorize_effects
+from ._frame import PanelFrame, prepare_panel
 
 
 def _as_columns(value: str | Sequence[str] | None, name: str) -> tuple[str, ...]:
@@ -65,17 +67,9 @@ def _memory_bytes(value: int | str | None) -> int | None:
     raise ValueError("memory_budget must be bytes or a string such as '4GB'")
 
 
-def _balanced_panel_shape(frame: pd.DataFrame, unit: str, time: str) -> tuple[int, int] | None:
+def _balanced_panel_shape(frame: PanelFrame, unit: str, time: str) -> tuple[int, int] | None:
     """Return the dense panel shape when every unit has the same time labels."""
-    sizes = frame.groupby(unit, sort=False, observed=True).size().to_numpy()
-    if not len(sizes) or not np.all(sizes == sizes[0]):
-        return None
-    n_periods = int(sizes[0])
-    n_units = len(sizes)
-    labels = frame[time].to_numpy().reshape(n_units, n_periods)
-    if not np.all(labels == labels[0]):
-        return None
-    return n_units, n_periods
+    return frame.balanced_shape(unit, time)
 
 
 def _prune_singletons(
@@ -101,7 +95,7 @@ def _prune_singletons(
 
 def _exact_panel_demean(
     values: np.ndarray,
-    frame: pd.DataFrame,
+    frame: PanelFrame,
     effects: tuple[str, ...],
     *,
     unit: str,
@@ -112,11 +106,11 @@ def _exact_panel_demean(
         return None
     shape = _balanced_panel_shape(frame, unit, time)
     if len(effects) == 1 and shape is None:
-        codes, uniques = pd.factorize(frame[effects[0]], sort=False)
-        counts = np.bincount(codes, minlength=len(uniques)).astype(np.float64)
+        codes, n_groups = frame.factorize((effects[0],))
+        counts = np.bincount(codes, minlength=n_groups).astype(np.float64)
         transformed = np.asarray(values, dtype=np.float64).copy()
         for column in range(transformed.shape[1]):
-            sums = np.bincount(codes, weights=transformed[:, column], minlength=len(uniques))
+            sums = np.bincount(codes, weights=transformed[:, column], minlength=n_groups)
             transformed[:, column] -= sums[codes] / counts[codes]
         method = "exact_group_unit" if effects == (unit,) else "exact_group_time"
         return transformed, DemeanDiagnostics(
@@ -225,26 +219,10 @@ def _lag_requests(
 
 
 def _add_lags(
-    frame: pd.DataFrame, unit: str, requests: Sequence[tuple[str, int]]
-) -> tuple[pd.DataFrame, tuple[str, ...], np.ndarray]:
+    frame: PanelFrame, unit: str, requests: Sequence[tuple[str, int]]
+) -> tuple[PanelFrame, tuple[str, ...], np.ndarray]:
     """Generate within-unit row lags and identify rows valid as LP anchors."""
-    output = frame.copy()
-    feature_names: list[str] = []
-    seen: set[tuple[str, int]] = set()
-    for source, lag in requests:
-        key = (source, lag)
-        if key in seen:
-            continue
-        seen.add(key)
-        feature = f"{source}_lag{lag}"
-        if feature in output.columns:
-            raise ValueError(f"generated lag feature {feature!r} conflicts with a supplied model column")
-        output[feature] = output.groupby(unit, sort=False, observed=True)[source].shift(lag)
-        feature_names.append(feature)
-    if not feature_names:
-        return output, (), np.ones(len(output), dtype=bool)
-    valid = output.loc[:, feature_names].notna().all(axis=1).to_numpy()
-    return output, tuple(feature_names), valid
+    return frame.add_lags(unit, requests)
 
 
 class LocalProjection:
@@ -341,7 +319,7 @@ class LocalProjection:
 
     def fit(
         self,
-        data: pd.DataFrame,
+        data: Any,
         *,
         outcome: str,
         shock: str | Sequence[str],
@@ -363,8 +341,6 @@ class LocalProjection:
         within each unit. Rows without every requested lag are not used as LP
         anchors, but remain available as future outcomes.
         """
-        if not isinstance(data, pd.DataFrame):
-            raise TypeError("data must be a pandas DataFrame")
         shocks = _as_columns(shock, "shock")
         if not shocks:
             raise ValueError("shock must be a column name or a non-empty sequence of column names")
@@ -378,9 +354,6 @@ class LocalProjection:
             required = (*required, *(column for term in cluster_terms for column in term))
         elif cluster_terms:
             raise ValueError("cluster is only valid when covariance='cluster'")
-        missing = sorted(set(required).difference(data.columns))
-        if missing:
-            raise ValueError(f"data is missing required columns: {missing}")
         if len(set((*shocks, *controls))) != len((*shocks, *controls)):
             raise ValueError("shock and controls must not contain duplicate columns")
 
@@ -390,26 +363,10 @@ class LocalProjection:
             *_lag_requests(control_lags, controls, "control_lags"),
         )
 
-        frame = data.loc[:, list(dict.fromkeys(required))].copy()
-        if frame.isna().any().any():
-            raise ValueError("v0.1 requires complete data in all model columns")
         numeric_columns = (outcome, *shocks, *controls)
-        try:
-            for column in dict.fromkeys(numeric_columns):
-                frame[column] = pd.to_numeric(frame[column], errors="raise").astype(np.float64)
-        except (TypeError, ValueError) as error:
-            raise ValueError("outcome, shock, and controls must be numeric") from error
-        if not np.isfinite(frame.loc[:, numeric_columns].to_numpy(dtype=float)).all():
-            raise ValueError("outcome, shock, and controls must be finite")
-        if frame.duplicated([unit, time]).any():
-            raise ValueError("unit and time must uniquely identify panel observations")
-
-        panel_order = pd.MultiIndex.from_frame(frame[[unit, time]])
-        input_was_sorted = panel_order.is_monotonic_increasing
-        if not input_was_sorted:
-            frame = frame.sort_values([unit, time], kind="stable")
+        frame, input_was_sorted = prepare_panel(data, required, numeric_columns)
         frame, lag_feature_names, valid_lag_rows = _add_lags(frame, unit, lag_requests)
-        if frame.empty:
+        if not len(frame):
             raise ValueError("data must contain at least one panel unit")
         future_positions, lead_path = self._lead_positions(frame, unit=unit, time=time)
         future_valid = future_positions >= 0
@@ -434,11 +391,11 @@ class LocalProjection:
                 masks[:, horizon], singleton_dropped[horizon], singleton_rounds[horizon] = result
 
         base_features = (*shocks, *controls, *lag_feature_names)
-        base_x = frame.loc[:, list(base_features)].to_numpy(dtype=np.float64)
+        base_x = frame.matrix(base_features, dtype=np.float64)
         if not effects:
             base_x = np.column_stack((np.ones(len(frame), dtype=np.float64), base_x))
         feature_names = ("Intercept", *base_features) if not effects else base_features
-        outcome_values = frame[outcome].to_numpy(dtype=np.float64)
+        outcome_values = frame.column(outcome).astype(np.float64, copy=False)
         outcome_prefix = None
         dense_shape = _balanced_panel_shape(frame, unit, time)
         if self.response == "cumulative" and lead_path == "balanced_arithmetic":
@@ -480,7 +437,7 @@ class LocalProjection:
             if not mask.any():
                 raise ValueError(f"no valid observations at horizon {horizons[0]}")
             positions = np.flatnonzero(mask)
-            anchor = frame.iloc[positions]
+            anchor = frame.take(positions)
             x = base_x[mask]
             exact_x = _exact_panel_demean(x, anchor, effects, unit=unit, time=time)
             if exact_x is None:
@@ -564,7 +521,7 @@ class LocalProjection:
             cluster_data = None
             if self.covariance == "cluster":
                 if cluster_terms == ((unit,),):
-                    unit_sizes = anchor.groupby(unit, sort=False, observed=True).size().to_numpy()
+                    unit_sizes = anchor.group_sizes(unit)
                     cluster_codes = [np.repeat(np.arange(len(unit_sizes), dtype=np.int64), unit_sizes)]
                     labels = [unit]
                 else:
@@ -660,7 +617,12 @@ class LocalProjection:
                     )
                 else:
                     covariance, covariance_diagnostics = hac(
-                        x_tilde, residuals, anchor[unit], anchor[time], batch_horizons, bread,
+                        x_tilde,
+                        residuals,
+                        anchor.column(unit),
+                        anchor.column(time),
+                        batch_horizons,
+                        bread,
                         max_lags=self.hac_lags, kernel=self.hac_kernel, debias=self.hac_debias,
                         driscoll_kraay=self.covariance == "driscoll_kraay",
                     )
@@ -700,7 +662,7 @@ class LocalProjection:
             methods.append(x_diag.method)
 
         z_value = NormalDist().inv_cdf(1 - self.alpha / 2)
-        sample_indices = tuple(frame.index[mask].copy() for mask in masks.T)
+        sample_indices = tuple(frame.sample_ids(mask) for mask in masks.T)
         self.coef_ = coefficients
         self.stderr_ = standard_errors
         self.covariance_ = covariances
@@ -714,8 +676,8 @@ class LocalProjection:
         self.response_ = self.response
         self.n_obs_by_horizon_ = masks.sum(axis=0, dtype=int)
         self.n_obs_ = int(self.n_obs_by_horizon_.max())
-        self.n_units_ = frame[unit].nunique()
-        self.n_periods_ = frame[time].nunique()
+        self.n_units_ = frame.nunique(unit)
+        self.n_periods_ = frame.nunique(time)
         self.sample_index_by_horizon_ = sample_indices
         self.sample_index_ = sample_indices[0]
         if residuals_by_horizon is None:
@@ -760,6 +722,7 @@ class LocalProjection:
             "method_by_cache_group": tuple(methods),
             "cache_mode": "shared_design" if len(group_masks) == 1 else "mask_grouped",
             "input_was_sorted": input_was_sorted,
+            "input_backend": frame.backend,
             "lead_path": lead_path,
             "batch_size": batch_size,
             "acceleration": self.demean_acceleration,
@@ -781,55 +744,10 @@ class LocalProjection:
         return self._irfplot
 
     def _lead_positions(
-        self, frame: pd.DataFrame, *, unit: str, time: str
+        self, frame: PanelFrame, *, unit: str, time: str
     ) -> tuple[np.ndarray, str]:
         """Resolve exact ``time + horizon`` outcome rows for every anchor."""
-        dense_shape = _balanced_panel_shape(frame, unit, time)
-        if dense_shape is not None:
-            n_units, n_periods = dense_shape
-            labels = frame[time].to_numpy().reshape(n_units, n_periods)[0]
-            try:
-                numeric = pd.to_numeric(pd.Series(labels), errors="raise").to_numpy(dtype=float)
-                arithmetic_safe = np.array_equal(
-                    numeric, numeric[0] + np.arange(n_periods)
-                )
-            except (TypeError, ValueError):
-                arithmetic_safe = True
-            if arithmetic_safe:
-                positions = np.full((len(frame), self.horizons + 1), -1, dtype=np.int64)
-                base = np.arange(len(frame), dtype=np.int64).reshape(n_units, n_periods)
-                for horizon in range(self.horizons + 1):
-                    if horizon < n_periods:
-                        positions.reshape(n_units, n_periods, -1)[:, : n_periods - horizon, horizon] = (
-                            base[:, horizon:]
-                        )
-                return positions, "balanced_arithmetic"
-        try:
-            numeric_time = pd.to_numeric(frame[time], errors="raise").to_numpy()
-        except (TypeError, ValueError):
-            panels = [group for _, group in frame.groupby(unit, sort=True, observed=True)]
-            time_index = panels[0][time].tolist()
-            if any(panel[time].tolist() != time_index for panel in panels[1:]):
-                raise ValueError(
-                    "unbalanced panels require numeric time labels for exact time + horizon alignment"
-                ) from None
-            positions = np.full((len(frame), self.horizons + 1), -1, dtype=int)
-            for panel_positions in frame.groupby(unit, sort=True, observed=True).indices.values():
-                panel_positions = np.asarray(panel_positions)
-                for horizon in range(self.horizons + 1):
-                    n_valid = len(panel_positions) - horizon
-                    if n_valid > 0:
-                        positions[panel_positions[:n_valid], horizon] = panel_positions[horizon:]
-            return positions, "balanced_labels"
-
-        panel_index = pd.MultiIndex.from_frame(frame[[unit, time]])
-        units = frame[unit].to_numpy()
-        positions = np.empty((len(frame), self.horizons + 1), dtype=int)
-        for horizon in range(self.horizons + 1):
-            positions[:, horizon] = panel_index.get_indexer(
-                pd.MultiIndex.from_arrays((units, numeric_time + horizon))
-            )
-        return positions, "indexed"
+        return frame.lead_positions(unit, time, self.horizons)
 
     def to_frame(self) -> pd.DataFrame:
         """Return coefficient paths in tidy long form."""
