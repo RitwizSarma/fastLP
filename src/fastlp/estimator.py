@@ -34,6 +34,28 @@ def _as_columns(value: str | Sequence[str] | None, name: str) -> tuple[str, ...]
     return columns
 
 
+def _with_column_names(data: Any, column_names: Sequence[str] | None) -> Any:
+    """Convert a named two-dimensional array to the standard dataframe input."""
+    if not isinstance(data, np.ndarray):
+        if column_names is None:
+            return data
+        raise ValueError("column_names is only valid when data is a NumPy array")
+    if column_names is None:
+        raise ValueError("column_names must be supplied when data is a NumPy array")
+    if data.ndim != 2:
+        raise ValueError("NumPy array data must be two-dimensional")
+    if isinstance(column_names, str):
+        raise ValueError("column_names must be a sequence of column names")
+    names = tuple(column_names)
+    if not all(isinstance(name, str) for name in names):
+        raise ValueError("column_names must contain only strings")
+    if len(set(names)) != len(names):
+        raise ValueError("column_names must not contain duplicates")
+    if len(names) != data.shape[1]:
+        raise ValueError("column_names must contain one name for each array column")
+    return pd.DataFrame(data, columns=names)
+
+
 ClusterTerm = str | tuple[str, ...]
 _HORIZON_BATCH_SIZE = 32
 
@@ -321,6 +343,7 @@ class LocalProjection:
         self,
         data: Any,
         *,
+        column_names: Sequence[str] | None = None,
         outcome: str,
         shock: str | Sequence[str],
         controls: Sequence[str] = (),
@@ -334,6 +357,10 @@ class LocalProjection:
     ) -> "LocalProjection":
         """Fit local projections according to the configured sample policy.
 
+        NumPy input must be a two-dimensional array accompanied by one unique
+        name per column through ``column_names``. It is converted to pandas at
+        the input boundary; dataframe inputs must not supply ``column_names``.
+
         A scalar lag setting includes all lags from one through that value;
         sequences select an arbitrary positive lag grid.  For shocks and
         controls, a mapping can assign a separate setting to each column.
@@ -341,6 +368,7 @@ class LocalProjection:
         within each unit. Rows without every requested lag are not used as LP
         anchors, but remain available as future outcomes.
         """
+        data = _with_column_names(data, column_names)
         shocks = _as_columns(shock, "shock")
         if not shocks:
             raise ValueError("shock must be a column name or a non-empty sequence of column names")

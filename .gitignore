@@ -7,3 +7,6 @@ src/fastlp/_fastlp_rust*.so
 
 # Any CSVs
 *.csv
+
+# Benchmark reports
+benchmark/results/

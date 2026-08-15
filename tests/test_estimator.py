@@ -20,6 +20,60 @@ def balanced_panel() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def test_numpy_array_input_matches_pandas() -> None:
+    data = balanced_panel()
+    options = {
+        "outcome": "y",
+        "shock": "shock",
+        "controls": ["control"],
+        "unit": "unit",
+        "time": "time",
+    }
+    expected = LocalProjection(horizons=2, covariance="hc1").fit(data, **options)
+    actual = LocalProjection(horizons=2, covariance="hc1").fit(
+        data.to_numpy(), column_names=data.columns.tolist(), **options
+    )
+
+    np.testing.assert_allclose(actual.coef_, expected.coef_)
+    np.testing.assert_allclose(actual.covariance_, expected.covariance_)
+    assert actual.feature_names_in_.tolist() == expected.feature_names_in_.tolist()
+
+
+@pytest.mark.parametrize(
+    ("data", "column_names", "message"),
+    [
+        (np.ones(3), ["y"], "two-dimensional"),
+        (np.ones((3, 2)), None, "must be supplied"),
+        (np.ones((3, 2)), ["y"], "one name for each array column"),
+        (np.ones((3, 2)), ["y", "y"], "must not contain duplicates"),
+    ],
+)
+def test_numpy_array_input_requires_valid_column_names(
+    data: np.ndarray, column_names: list[str] | None, message: str
+) -> None:
+    with pytest.raises((TypeError, ValueError), match=message):
+        LocalProjection(horizons=0).fit(
+            data,
+            column_names=column_names,
+            outcome="y",
+            shock="shock",
+            unit="unit",
+            time="time",
+        )
+
+
+def test_dataframe_input_rejects_column_names() -> None:
+    with pytest.raises(ValueError, match="only valid when data is a NumPy array"):
+        LocalProjection(horizons=0).fit(
+            balanced_panel(),
+            column_names=["y", "shock", "control", "unit", "time"],
+            outcome="y",
+            shock="shock",
+            unit="unit",
+            time="time",
+        )
+
+
 def test_cached_no_fe_matches_separate_ols() -> None:
     data = balanced_panel()
     fitted = LocalProjection(horizons=2, covariance="hc1").fit(

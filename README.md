@@ -87,9 +87,17 @@ offers a cached default plot through `lp.irfplot`.
 
 ## Data requirements
 
-- `data` must be a pandas `DataFrame` or Polars `DataFrame`/`LazyFrame`; 
-  NumPy arrays are not accepted currently. Backend selection is automatic 
-  from the input type.
+- `data` may be a pandas `DataFrame`, Polars `DataFrame`/`LazyFrame`, or a
+  two-dimensional NumPy array. For an array, pass a unique name for each
+  column through `column_names`, then use those names for `outcome`, `shock`,
+  `controls`, `unit`, and the other column-based options. Array input is
+  converted to pandas at the input boundary; dataframe backends are otherwise
+  selected automatically.
+- A two-dimensional NumPy array has one dtype. If unit IDs, time labels, fixed
+  effects, or clusters are strings alongside numeric model variables, NumPy
+  will generally use an object or string dtype. This is supported—numeric
+  outcome/shock/control columns are coerced during validation—but pandas or
+  Polars is more efficient for heterogeneous data.
 - Each `(unit, time)` pair must appear at most once. The panel may be
   unbalanced: units may have different observed periods and periods may be
   missing.
