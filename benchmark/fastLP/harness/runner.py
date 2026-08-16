@@ -4,7 +4,7 @@
 Examples (from the repository root)::
 
     uv run python benchmark/fastLP/harness/runner.py --scenario smoke --validate
-    uv run python benchmark/fastLP/harness/runner.py --csv benchmark/data/small_balanced.csv --repetitions 5
+    uv run python benchmark/fastLP/harness/runner.py --csv benchmark/data/n5000_t40.csv --horizons 12 --repetitions 5
 """
 
 from __future__ import annotations

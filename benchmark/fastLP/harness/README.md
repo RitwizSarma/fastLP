@@ -14,23 +14,23 @@ uv run python benchmark/fastLP/harness/runner.py --scenario smoke --validate
 uv run python benchmark/fastLP/harness/runner.py --scenario small --repetitions 5 --baseline --validate
 
 # Reuse the existing CSV data; loading remains outside the reported fit time
-uv run python benchmark/fastLP/harness/runner.py --csv benchmark/data/small_balanced.csv --horizons 12 --profile
+uv run python benchmark/fastLP/harness/runner.py --csv benchmark/data/n5000_t40.csv --horizons 12 --profile
 
 # Use Polars input or a Parquet source; loading remains outside the fit timer
 uv run --extra polars python benchmark/fastLP/harness/runner.py \
-  --csv benchmark/data/small_balanced.csv --horizons 12 --backend polars
+  --csv benchmark/data/n5000_t40.csv --horizons 12 --backend polars
 uv run python benchmark/fastLP/harness/runner.py \
-  --parquet benchmark/data/small_balanced.parquet --horizons 12 --backend pandas
+  --parquet benchmark/data/n5000_t40.parquet --horizons 12 --backend pandas
 
 # Vary N (rows, via units x periods) and K (shock plus controls) in fresh processes
 uv run python benchmark/fastLP/harness/grid.py \
   --n-units 312,1250,5000 --n-controls 1,8,32 \
   --n-periods 32 --horizons 12 --threads 1
 
-# Repeat selected cases with missing panel rows to expose the per-horizon-cache cost
+# Repeat selected complete-panel cases while varying N and K
 uv run python benchmark/fastLP/harness/grid.py \
-  --n-units 1250,5000 --n-controls 8 --unbalanced-shares 0.10 \
-  --n-periods 32 --horizons 12 --threads 1
+  --n-units 5000,10000 --n-controls 8 --n-periods 40 \
+  --horizons 12 --threads 1
 ```
 
 Each invocation creates `benchmark/results/fastlp_<UTC timestamp>/` with:
@@ -44,11 +44,10 @@ Each invocation creates `benchmark/results/fastlp_<UTC timestamp>/` with:
 - `agreement.json`: coefficient and standard-error error bounds when requested.
 - `fit.pstats` and `profile.txt` when `--profile` is supplied.
 
-`--baseline` times a deliberately independent-horizon implementation.  It is
-only intended for small, balanced inputs; use it to find the horizon count at
+`--baseline` times a deliberately independent-horizon implementation. It is
+intended for manageable complete panels; use it to find the horizon count at
 which cache construction pays off. `--validate` applies the same reference as
-a numerical regression check. The reference is intentionally unavailable for
-unbalanced designs, whose samples vary by horizon.
+a numerical regression check.
 
 The stage rows partition total fit time into lag construction, lead
 construction, singleton pruning, FE encoding, demeaning, rank checking,

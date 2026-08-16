@@ -1,9 +1,11 @@
+from importlib.metadata import version
+
 import numpy as np
 import pandas as pd
 import pytest
 import warnings
 
-from fastlp import FewClustersWarning, LocalProjection
+from fastlp import FewClustersWarning, LocalProjection, __version__
 from fastlp._demean import Residualizer, factorize_effects
 
 
@@ -18,6 +20,10 @@ def balanced_panel() -> pd.DataFrame:
                 {"unit": unit, "time": time, "y": outcome, "shock": shock, "control": control}
             )
     return pd.DataFrame(rows)
+
+
+def test_package_exposes_installed_version() -> None:
+    assert __version__ == version("fastlp")
 
 
 def test_numpy_array_input_matches_pandas() -> None:

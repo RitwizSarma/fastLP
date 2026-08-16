@@ -1,14 +1,16 @@
-# fastLP benchmark runner
+# fastLP cross-library runner
 
-Run one of the four datasets with `uv` from the project root:
+Generate the two benchmark panels from the project root, then run:
 
 ```bash
-uv run python benchmark/fastLP/benchmark.py small_balanced
-uv run python benchmark/fastLP/benchmark.py small_unbalanced
-uv run python benchmark/fastLP/benchmark.py large_balanced
-uv run python benchmark/fastLP/benchmark.py large_unbalanced
+uv run python benchmark/data/generate_data.py
+uv run python benchmark/fastLP/benchmark.py n5000_t40
+uv run python benchmark/fastLP/benchmark.py n10000_t40
 ```
 
-CSV loading is excluded from the reported estimation time. The runner uses
-unit and time fixed effects, clusters standard errors by unit, and prints the
-complete coefficient table for every horizon.
+Each command performs the complete 13-horizon estimation 200 times. It writes
+`results_fastlp_<dataset>.csv` with one row per repetition and wall-clock,
+user-CPU, and system-CPU timing columns, plus
+`estimates_fastlp_<dataset>.csv` with the first fit's coefficient estimates by
+horizon. Mean, SD, median, Q1, Q3, minimum, and maximum statistics for all
+three timing series are printed to the screen.

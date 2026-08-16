@@ -1,0 +1,16 @@
+[
+  {
+    "name": "n5000_t40",
+    "n_units": 5000,
+    "n_periods": 40,
+    "horizon": 12,
+    "seed": 2030
+  },
+  {
+    "name": "n10000_t40",
+    "n_units": 10000,
+    "n_periods": 40,
+    "horizon": 12,
+    "seed": 2031
+  }
+]
