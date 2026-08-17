@@ -5,6 +5,6 @@ from importlib.metadata import version
 from .estimator import FewClustersWarning, LocalProjection
 from .plotting import plot_irf
 
-__version__ = version("fastlp")
+__version__ = version("fastlp-py")
 
 __all__ = ["FewClustersWarning", "LocalProjection", "__version__", "plot_irf"]

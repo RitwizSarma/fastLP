@@ -40,13 +40,13 @@ and thread configuration.  -->
 Once fastLP is published on PyPI:
 
 ```bash
-pip install fastlp
+pip install fastlp-py
 ```
 
 Install the optional Polars input backend with:
 
 ```bash
-pip install "fastlp[polars]"
+pip install "fastlp-py[polars]"
 ```
 
 fastLP requires Python 3.12 or later. Wheels include the compiled Rust

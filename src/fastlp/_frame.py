@@ -397,5 +397,7 @@ def prepare_panel(
         return PolarsFrame.prepare(data, required, numeric)
     module = type(data).__module__.split(".", 1)[0]
     if module == "polars" and pl is None:
-        raise ImportError("Polars input requires the optional dependency: install fastlp[polars]")
+        raise ImportError(
+            "Polars input requires the optional dependency: install fastlp-py[polars]"
+        )
     raise TypeError("data must be a pandas DataFrame, polars DataFrame, or polars LazyFrame")

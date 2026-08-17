@@ -2,78 +2,71 @@
 
 `fastLP` estimates panel local projections for massive datasets very very
 quickly. Beginner-friendly API, Rust core, and helpful functions for
-almost everything an empirical economist might need.
+IRF graphs and tables: everything an empirical economist might need.
 
 ## Installation
 
-For now, install fastLP from a Git clone. You need Python 3.12 or later,
-[`uv`](https://docs.astral.sh/uv/), and a Rust toolchain with Cargo: fastLP
-builds its native fixed-effect backend during installation.
+fastLP requires Python 3.12 or later. Install it from PyPI or `uv` with:
 
 ```bash
-git clone git@github.com:RitwizSarma/fastLP.git
-cd fastLP
-uv sync
+pip install fastlp-py
+uv add fastlp-py
 ```
 
-Polars input support is optional but recommended if you're
-working with large datasets:
+Polars input support is optional and can be installed with:
 
 ```bash
-uv sync --extra polars
+pip install "fastlp-py[polars]"
+uv add "fastlp-py[polars]"
+```
+
+To work on fastLP itself, clone the repository and use
+[`uv`](https://docs.astral.sh/uv/). A Rust toolchain with Cargo is required for
+source builds:
+
+```bash
+git clone https://github.com/RitwizSarma/fastLP.git
+cd fastLP
+uv sync --all-groups
 ```
 
 ## Quick start
 
-Pass a pandas or Polars frame and identify its outcome, shock, panel unit, and
-time columns. 
+Get started quickly with the `scikit`-style API:
 
 ```python
 from fastlp import LocalProjection
 
-lp = LocalProjection(horizons=12, covariance="driscoll_kraay")
+lp = LocalProjection(horizons=12, covariance="cluster")
 lp.fit(
     data,
-    outcome="log_output",
-    shock="monetary_shock",
-    controls=["output_l1", "inflation_l1"],
-    outcome_lags=range(1,4),
+    outcome="y",
+    shock="shock",
+    outcome_lags=range(1, 4),
     shock_lags=2,
-    control_lags={"output_l1": range(1,3), "inflation_l1": 1},
+    unit="unit",
+    time="time",
+    fixed_effects=["unit", "time"],
+    cluster="unit"
 )
 ```
 
-The following example estimates a 20-period response with country and
-quarter fixed effects and country-clustered standard errors, and 
-retrieves the results and impulse response plot.
+Make sure you explicitly indicate the fixed effects specification. `fastLP`
+does _not_ implicitly use unit- or time-fixed effects. For multi-way fixed
+effects, use a tuple like `fixed_effects=["unit", ("quarter", "zipcode")]`.
+
+Retrieve the results and plot the shock response:
 
 <details>
 <summary>Code</summary>
 
 ```python
-from fastlp import LocalProjection
-
-lp = LocalProjection(horizons=20, covariance="cluster", sample="common")
-lp.fit(
-    data,
-    outcome="log_output",
-    shock="monetary_shock",
-    controls=["output_l1", "inflation_l1"],
-    outcome_lags=[1, 2, 4],
-    shock_lags=2,
-    control_lags={"output_l1": [1, 3], "inflation_l1": 1},
-    unit="country",
-    time="quarter",
-    fixed_effects=["country", "quarter"],
-    cluster="country",
-)
-
 print(lp.to_frame())
 
 ax = lp.plot_irf(
-    "monetary_shock",
-    title="Output response to a monetary shock",
-    ylabel="Log points",
+    "shock",
+    title="Response of y to shock",
+    ylabel="Outcome units",
 )
 ax.figure.savefig("irf.png", bbox_inches="tight")
 ```
@@ -84,35 +77,14 @@ offers a cached default plot through `lp.irfplot`.
 
 </details>
 
+For a more detailed example, check out the [documentation](https://ritwizsarma.github.io/fastLP/quickstart.html).
 
-## Data requirements
 
-- `data` may be a pandas `DataFrame`, Polars `DataFrame`/`LazyFrame`, or a
-  two-dimensional NumPy array. For an array, pass a unique name for each
-  column through `column_names`, then use those names for `outcome`, `shock`,
-  `controls`, `unit`, and the other column-based options. Array input is
-  converted to pandas at the input boundary; dataframe backends are otherwise
-  selected automatically.
-- A two-dimensional NumPy array has one dtype. If unit IDs, time labels, fixed
-  effects, or clusters are strings alongside numeric model variables, NumPy
-  will generally use an object or string dtype. This is supported—numeric
-  outcome/shock/control columns are coerced during validation—but pandas or
-  Polars is more efficient for heterogeneous data.
-- Each `(unit, time)` pair must appear at most once. The panel may be
-  unbalanced: units may have different observed periods and periods may be
-  missing.
-- The outcome, shocks, and controls must be numeric, finite, and non-missing.
-  Model columns such as fixed effects and cluster identifiers must also be
-  complete.
-- Horizons are exact leads. With numeric time labels, a horizon of `h` uses
-  the observation at `time + h`; missing periods are not treated as adjacent.
+<!-- ## Data input flexibility
 
-Rows that cannot provide the requested lags or future outcome are excluded
-from the relevant regression sample. Use `sample="common"` (the default) to
-hold the anchor sample fixed across all horizons, or `sample="per_horizon"`
-to retain every valid anchor separately at each horizon.
+- `pandas`, Polars (including `LazyFrames`) and `numpy` arrays are all allowed.
 
-Polars remains native through validation, sorting, lag construction, grouping,
+- Polars remains native through validation, sorting, lag construction, grouping,
 and exact lead alignment. A lazy scan projects the required model columns and
 is collected once before the numerical NumPy/Rust estimation core:
 
@@ -123,13 +95,13 @@ data = pl.scan_parquet("panel.parquet")
 lp.fit(data, outcome="y", shock="shock", unit="unit", time="time")
 ```
 
-`to_frame()` continues to return pandas for every input backend. Retained
+- `to_frame()` continues to return pandas for every input backend. Retained
 sample identifiers preserve the pandas index for pandas input and use original
-zero-based row positions for Polars input.
+zero-based row positions for Polars input. -->
 
-## Estimation and inference
+<!-- ## Estimation and inference
 
-fastLP supports level and cumulative responses, one or more shocks, generated
+fastLP supports level and cumulative responses, generated
 within-unit lags, and absorbed fixed effects. It provides homoskedastic,
 HC0--HC3, clustered CR0/CR1, within-unit HAC/Newey--West, and
 Driscoll--Kraay covariance estimators.
@@ -152,7 +124,7 @@ cluster dimensions. fastLP warns when a requested cluster term has fewer than
 50 groups; this is a diagnostic, not a correction for few-cluster inference.
 
 HAC and Driscoll--Kraay estimation require integral numeric time labels. Use
-`hac_lags`, `hac_kernel`, and `hac_debias` to configure them.
+`hac_lags`, `hac_kernel`, and `hac_debias` to configure them. -->
 
 ## License
 

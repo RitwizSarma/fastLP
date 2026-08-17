@@ -23,7 +23,7 @@ def balanced_panel() -> pd.DataFrame:
 
 
 def test_package_exposes_installed_version() -> None:
-    assert __version__ == version("fastlp")
+    assert __version__ == version("fastlp-py")
 
 
 def test_numpy_array_input_matches_pandas() -> None:

@@ -13,8 +13,23 @@ permissions:
   contents: read
 
 jobs:
+  tests:
+    name: Test suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+      - name: Install Python
+        run: uv python install 3.12
+      - name: Run tests
+        run: uv run --frozen pytest -q
+
   wheels:
     name: ${{ matrix.name }}
+    needs: tests
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -29,11 +44,11 @@ jobs:
             target: aarch64-unknown-linux-gnu
             manylinux: "2_28"
           - name: macOS x86_64
-            os: macos-13
+            os: macos-15-intel
             target: x86_64-apple-darwin
             manylinux: "off"
           - name: macOS aarch64
-            os: macos-14
+            os: macos-15
             target: aarch64-apple-darwin
             manylinux: "off"
           - name: Windows x86_64
@@ -56,6 +71,7 @@ jobs:
           if-no-files-found: error
 
   source-distribution:
+    needs: tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -68,6 +84,25 @@ jobs:
           name: source-distribution
           path: dist/*.tar.gz
           if-no-files-found: error
+
+  publish-testpypi:
+    if: github.event_name == 'workflow_dispatch'
+    needs: [wheels, source-distribution]
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/fastlp-py
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish package distributions to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
 
   publish-release-assets:
     if: github.event_name == 'release'
