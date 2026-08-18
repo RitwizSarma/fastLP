@@ -4,7 +4,6 @@ on:
   pull_request:
   push:
     branches: [master]
-    tags: ["v*"]
   release:
     types: [published]
   workflow_dispatch:
@@ -103,6 +102,23 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           repository-url: https://test.pypi.org/legacy/
+
+  publish-pypi:
+    if: github.event_name == 'release' && github.event.action == 'published'
+    needs: [wheels, source-distribution]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/fastlp-py
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish package distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
 
   publish-release-assets:
     if: github.event_name == 'release'

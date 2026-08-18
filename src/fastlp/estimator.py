@@ -248,12 +248,9 @@ def _add_lags(
 
 
 class LocalProjection:
-    """Fast local projections with an explicit horizon-sample policy.
+    """Fast local projections estimator class.
 
-    ``sample="common"`` uses one anchor sample at every horizon, so the
-    residualized RHS and its factorization are shared. ``sample="per_horizon"``
-    retains every valid anchor at each horizon and shares a cache only among
-    horizons with an identical retained-row mask.
+    Estimate the impulse response at each horizon.
     """
 
     def __init__(
@@ -355,7 +352,7 @@ class LocalProjection:
         fixed_effects: Sequence[str] = (),
         cluster: ClusterTerm | Sequence[ClusterTerm] | None = None,
     ) -> "LocalProjection":
-        """Fit local projections according to the configured sample policy.
+        """Fit local projections.
 
         NumPy input must be a two-dimensional array accompanied by one unique
         name per column through ``column_names``. It is converted to pandas at

@@ -11,7 +11,7 @@ designs across horizons when the regression sample permits it.
 - pandas, Polars, and NumPy inputs
 - level and cumulative responses
 - generates outcome, shock, and control lags
-- absorbs complex fixed effects
+- absorbs complex fixed effects efficiently
 - homoskedastic, HC0--HC3, clustered, HAC/Newey--West, and
   Driscoll--Kraay covariance estimators
 - tidy results and impulse-response plots
@@ -37,20 +37,22 @@ and thread configuration.  -->
 
 ## Installation
 
-Once fastLP is published on PyPI:
+Get fastLP from PyPI or `uv`:
 
 ```bash
 pip install fastlp-py
+uv add fastlp-py
 ```
 
 Install the optional Polars input backend with:
 
 ```bash
 pip install "fastlp-py[polars]"
+uv add "fastlp-py[polars]"
 ```
 
 fastLP requires Python 3.12 or later. Wheels include the compiled Rust
-extension, so normal installations do not require a Rust toolchain.
+extension.
 
 ```{toctree}
 :maxdepth: 2
