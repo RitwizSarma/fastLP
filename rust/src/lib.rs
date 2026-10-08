@@ -167,6 +167,7 @@ impl HdfePlan {
                             .iter()
                             .zip(previous.iter())
                             .all(|(a, b)| (a - b).abs() < tol)
+                            && projection_error(column, &self.code_columns, &self.group_sizes) < tol
                         {
                             return (iteration as i64, accepted);
                         }

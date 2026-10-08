@@ -192,7 +192,71 @@ def test_scaled_cholesky_reports_absorbed_and_collinear_designs() -> None:
         )
 
 
-def test_cholesky_failure_reports_horizon_and_condition(
+def test_within_variation_check_is_invariant_to_absorbed_levels() -> None:
+    rng = np.random.default_rng(1729)
+    data = pd.DataFrame(
+        {
+            "unit": np.repeat(np.arange(20), 3),
+            "time": np.tile(np.arange(3), 20),
+            "shock": rng.normal(size=60),
+            "y": rng.normal(size=60),
+        }
+    )
+    options = {
+        "outcome": "y",
+        "shock": "shock",
+        "unit": "unit",
+        "time": "time",
+        "fixed_effects": ["unit"],
+    }
+    baseline = LocalProjection(horizons=0, covariance="hc0").fit(data, **options)
+    shifted = data.copy()
+    shifted["shock"] += 1e8
+    actual = LocalProjection(horizons=0, covariance="hc0").fit(shifted, **options)
+
+    np.testing.assert_allclose(actual.coef_, baseline.coef_, rtol=1e-8, atol=1e-10)
+    np.testing.assert_allclose(
+        actual.covariance_, baseline.covariance_, rtol=1e-8, atol=1e-10
+    )
+    diagnostics = actual.linear_algebra_diagnostics_["by_cache_group"][0]
+    assert (
+        diagnostics["normalized_within_norms"][0] > diagnostics["within_signal_floor"]
+    )
+
+
+def test_iterative_within_certificate_rejects_absorbed_dust_but_keeps_signal() -> None:
+    rng = np.random.default_rng(24680)
+    n_obs = 500
+    data = pd.DataFrame(
+        {
+            "unit": np.arange(n_obs),
+            "time": np.zeros(n_obs, dtype=int),
+            "first": rng.integers(0, 35, n_obs),
+            "second": rng.integers(0, 25, n_obs),
+            "shock": rng.normal(size=n_obs),
+            "y": rng.normal(size=n_obs),
+        }
+    )
+    options = {
+        "outcome": "y",
+        "shock": "shock",
+        "unit": "unit",
+        "time": "time",
+        "fixed_effects": ["first", "second"],
+    }
+    baseline = LocalProjection(horizons=0, covariance="hc0").fit(data, **options)
+    shifted = data.copy()
+    shifted["shock"] += 1e8
+    actual = LocalProjection(horizons=0, covariance="hc0").fit(shifted, **options)
+    np.testing.assert_allclose(actual.coef_, baseline.coef_, rtol=2e-7, atol=1e-9)
+
+    absorbed = data.copy()
+    absorbed["shock"] = absorbed["first"].astype(float) + 1e8
+    with pytest.raises(ValueError, match="negligible within variation.*shock"):
+        LocalProjection(horizons=0, covariance="hc0").fit(absorbed, **options)
+
+
+def test_cholesky_failure_falls_back_to_qr(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import fastlp.estimator as estimator
@@ -201,18 +265,16 @@ def test_cholesky_failure_reports_horizon_and_condition(
         raise np.linalg.LinAlgError("forced failure")
 
     monkeypatch.setattr(estimator.np.linalg, "cholesky", fail_cholesky)
-    with pytest.raises(
-        ValueError,
-        match="Cholesky factorization.*horizon 0.*condition number",
-    ):
-        LocalProjection(horizons=0, covariance="hc1").fit(
-            covariance_panel(),
-            outcome="y",
-            shock="shock",
-            controls=["control"],
-            unit="unit",
-            time="time",
-        )
+    data = covariance_panel()
+    fitted = LocalProjection(horizons=0, covariance="hc1").fit(
+        data, outcome="y", shock="shock", controls=["control"], unit="unit", time="time"
+    )
+    expected = np.linalg.lstsq(
+        np.column_stack([np.ones(len(data)), data[["shock", "control"]]]), data.y, rcond=None
+    )[0]
+    np.testing.assert_allclose(fitted.coef_[0], expected, atol=1e-12)
+    assert fitted.linear_algebra_diagnostics_["solver"] == "scaled_qr"
+    assert fitted.linear_algebra_diagnostics_["by_cache_group"][0]["fallback_reason"] == "cholesky_failed"
 
 
 def test_prepared_residualizer_reuses_topology_and_matches_group_projection() -> None:
@@ -378,21 +440,6 @@ def covariance_panel() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-@pytest.mark.parametrize("covariance", ["homoskedastic", "hc0", "hc1", "hc2", "hc3", "hac", "driscoll_kraay"])
-def test_extended_covariances_produce_finite_cached_results(covariance: str) -> None:
-    fitted = LocalProjection(horizons=2, covariance=covariance).fit(
-        covariance_panel(),
-        outcome="y",
-        shock="shock",
-        controls=["control"],
-        unit="unit",
-        time="time",
-    )
-    assert np.isfinite(fitted.stderr_).all()
-    assert fitted.covariance_config_["kind"] == covariance
-    assert len(fitted.covariance_diagnostics_) == 3
-
-
 def test_multiway_and_interaction_clustering_are_explicit() -> None:
     data = covariance_panel()
     multiway = LocalProjection(horizons=2, covariance="cluster").fit(
@@ -417,6 +464,72 @@ def test_multiway_and_interaction_clustering_are_explicit() -> None:
     assert interaction.covariance_config_["cluster_terms"] == ("industry#time",)
     assert len(multiway.covariance_diagnostics_[0]["components"]) == 3
     assert np.isfinite(interaction.stderr_).all()
+
+
+def test_negative_cluster_variance_rejection_is_scale_invariant() -> None:
+    rng = np.random.default_rng(0)
+    n_obs = 40
+    data = pd.DataFrame(
+        {
+            "unit": np.repeat(np.arange(10), 4),
+            "time": np.tile(np.arange(4), 10),
+            "first_cluster": rng.integers(0, 4, n_obs),
+            "second_cluster": rng.integers(0, 4, n_obs),
+            "shock": rng.normal(size=n_obs),
+            "y": rng.normal(size=n_obs),
+        }
+    )
+    for scale in (1.0, 1e9):
+        scaled = data.copy()
+        scaled["shock"] *= scale
+        with pytest.raises(
+            ValueError, match="cluster covariance has a negative variance"
+        ):
+            LocalProjection(
+                horizons=0,
+                covariance="cluster",
+                few_cluster_threshold=None,
+            ).fit(
+                scaled,
+                outcome="y",
+                shock="shock",
+                unit="unit",
+                time="time",
+                fixed_effects=["unit"],
+                cluster=["first_cluster", "second_cluster"],
+            )
+
+
+def test_roundoff_negative_variance_cleanup_is_coherent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fastlp import estimator
+
+    def roundoff_negative(x, residuals, *args, **kwargs):
+        covariance = np.zeros((residuals.shape[1], x.shape[1], x.shape[1]))
+        covariance[:, 0, 0] = -np.finfo(float).eps
+        scale = np.ones_like(covariance) * 1e6
+        diagnostics = tuple({"terms": ("unit",)} for _ in range(1))
+        return covariance, diagnostics, scale
+
+    monkeypatch.setattr(estimator, "cluster_covariance", roundoff_negative)
+    fitted = LocalProjection(
+        horizons=0,
+        covariance="cluster",
+        few_cluster_threshold=None,
+    ).fit(
+        covariance_panel(),
+        outcome="y",
+        shock="shock",
+        unit="unit",
+        time="time",
+        fixed_effects=["unit"],
+        cluster="unit",
+    )
+
+    assert fitted.covariance_[0, 0, 0] == 0.0
+    assert fitted.stderr_[0, 0] == 0.0
+    assert fitted.covariance_diagnostics_[0]["negative_variance_cleanup"] == (0,)
 
 
 def test_cluster_validation_limits_terms_and_rejects_hac_cluster_mix() -> None:
@@ -503,9 +616,10 @@ def test_fit_generates_nonconsecutive_lags_without_dropping_future_outcomes() ->
         "control_lag2",
     ]
     assert fitted.n_obs_ == 25
+    assert fitted.demeaning_diagnostics_["lag_path"] == "consecutive_shift"
 
 
-def test_unbalanced_lagged_design_matches_separate_ols() -> None:
+def test_gapped_lagged_design_uses_exact_calendar_matches() -> None:
     rng = np.random.default_rng(9876)
     data = pd.DataFrame(
         [
@@ -532,23 +646,29 @@ def test_unbalanced_lagged_design_matches_separate_ols() -> None:
         for _, panel in data.groupby("unit", sort=True):
             panel = panel.sort_values("time").reset_index(drop=True)
             indexed_y = panel.set_index("time").y
-            for row_index, row in panel.iterrows():
-                if row_index < 3 or row.time + horizon not in indexed_y.index:
+            indexed_shock = panel.set_index("time").shock
+            for row in panel.itertuples():
+                required_times = (row.time - 1, row.time - 2, row.time - 3)
+                if (
+                    any(date not in indexed_y.index for date in required_times)
+                    or row.time + horizon not in indexed_y.index
+                ):
                     continue
                 x_rows.append(
                     [
                         1.0,
                         row.shock,
-                        panel.iloc[row_index - 1].y,
-                        panel.iloc[row_index - 3].y,
-                        panel.iloc[row_index - 1].shock,
-                        panel.iloc[row_index - 2].shock,
+                        indexed_y.loc[row.time - 1],
+                        indexed_y.loc[row.time - 3],
+                        indexed_shock.loc[row.time - 1],
+                        indexed_shock.loc[row.time - 2],
                     ]
                 )
                 y_rows.append(indexed_y.loc[row.time + horizon])
         expected.append(np.linalg.lstsq(np.asarray(x_rows), y_rows, rcond=None)[0])
 
     np.testing.assert_allclose(fitted.coef_, expected, atol=1e-10)
+    assert fitted.demeaning_diagnostics_["lag_path"] == "indexed"
 
 
 def test_cumulative_response_matches_manual_regressions() -> None:
@@ -618,21 +738,25 @@ def test_balanced_fast_path_matches_general_demeaning() -> None:
 
 
 def test_memory_budget_and_residual_retention() -> None:
+    options = dict(
+        outcome="y", shock="shock", unit="unit", time="time", cluster="unit",
+    )
+    baseline = LocalProjection(
+        horizons=3, covariance="cluster", retain_residuals=False,
+        memory_budget="1MB", few_cluster_threshold=None,
+    ).fit(covariance_panel(), **options)
     fitted = LocalProjection(
         horizons=3,
         covariance="cluster",
         retain_residuals=False,
-        memory_budget="1KB",
-    ).fit(
-        covariance_panel(),
-        outcome="y",
-        shock="shock",
-        unit="unit",
-        time="time",
-        cluster="unit",
-    )
+        memory_budget=baseline.memory_diagnostics_["minimum_bytes"],
+        few_cluster_threshold=None,
+    ).fit(covariance_panel(), **options)
     assert fitted.residuals_ is None
     assert fitted.demeaning_diagnostics_["batch_size"] == 1
+    assert fitted.memory_diagnostics_["planned_peak_bytes"] <= fitted.memory_budget
+    np.testing.assert_allclose(fitted.coef_, baseline.coef_)
+    np.testing.assert_allclose(fitted.covariance_, baseline.covariance_)
 
 
 def test_new_option_validation() -> None:
@@ -726,6 +850,60 @@ def test_accelerated_three_way_absorption_matches_reference() -> None:
             )
 
 
+@pytest.mark.parametrize("use_native", [True, False])
+@pytest.mark.parametrize("scale", [1e-12, 1e-8, 1e8, 1e12])
+def test_iterative_absorption_is_scale_invariant(use_native: bool, scale: float) -> None:
+    rng = np.random.default_rng(992)
+    n_obs = 500
+    effects = pd.DataFrame(
+        {
+            "first": rng.integers(0, 35, n_obs),
+            "second": rng.integers(0, 25, n_obs),
+            "third": rng.integers(0, 15, n_obs),
+        }
+    )
+    codes, counts = factorize_effects(effects, ("first", "second", "third"))
+    values = rng.normal(size=(n_obs, 3))
+    plan = Residualizer(codes, counts)
+    if use_native and plan._native is None:
+        pytest.skip("native demeaning extension is unavailable")
+    if not use_native:
+        plan._native = None
+
+    baseline, baseline_diagnostics = plan.transform(
+        values, tol=1e-10, max_iter=10_000, acceleration="irons_tuck"
+    )
+    rescaled, rescaled_diagnostics = plan.transform(
+        values * scale, tol=1e-10, max_iter=10_000, acceleration="irons_tuck"
+    )
+
+    np.testing.assert_allclose(rescaled / scale, baseline, rtol=1e-11, atol=1e-11)
+    np.testing.assert_array_equal(
+        rescaled_diagnostics.iterations, baseline_diagnostics.iterations
+    )
+    for dimension, n_groups in enumerate(counts):
+        for group in range(n_groups):
+            group_mean = (rescaled[codes[:, dimension] == group] / scale).mean(axis=0)
+            np.testing.assert_allclose(group_mean, 0.0, atol=1e-10)
+
+
+def test_hc2_hc3_with_fixed_effects_fail_fast_and_recommend_hc0_hc1() -> None:
+    data = balanced_panel()
+    for covariance in ("hc2", "hc3"):
+        with pytest.raises(
+            ValueError,
+            match=r"use covariance='hc0' or covariance='hc1'",
+        ):
+            LocalProjection(horizons=0, covariance=covariance).fit(
+                data,
+                outcome="y",
+                shock="shock",
+                unit="unit",
+                time="time",
+                fixed_effects=["unit"],
+            )
+
+
 def test_few_cluster_warning_and_opt_out() -> None:
     data = covariance_panel()
     with pytest.warns(FewClustersWarning, match="only 8 clusters"):
@@ -759,6 +937,7 @@ def test_recursive_singleton_pruning_reaches_stable_sample() -> None:
         (0, 1),
         (1, 0),
         (1, 1),
+        (0, 0),  # Positive residual df in the retained core, even with a slope.
         (1, 2),
         (2, 2),
         (2, 3),
@@ -796,11 +975,11 @@ def test_recursive_singleton_pruning_reaches_stable_sample() -> None:
         fixed_effects=["first_fe", "second_fe"],
     )
 
-    assert dropped.n_obs_ == 4
-    assert dropped.sample_index_.tolist() == [0, 1, 2, 3]
+    assert dropped.n_obs_ == 5
+    assert dropped.sample_index_.tolist() == [0, 1, 2, 3, 4]
     assert dropped.singleton_diagnostics_["dropped_by_horizon"].tolist() == [4]
     assert dropped.singleton_diagnostics_["rounds_by_horizon"].tolist() == [4]
-    assert kept.n_obs_ == 8
+    assert kept.n_obs_ == 9
     assert kept.singleton_diagnostics_["dropped_by_horizon"].tolist() == [0]
 
 
@@ -863,7 +1042,7 @@ def test_irf_plot_is_cached_styled_and_selectable() -> None:
     plt.close(selected.figure)
 
 
-def test_nearly_unit_spaced_time_uses_exact_indexed_leads() -> None:
+def test_fractional_time_is_rejected_before_lead_construction() -> None:
     rows = []
     for unit in range(4):
         for time in (0.0, 1.0, 2.000000001, 3.0):
@@ -876,6 +1055,46 @@ def test_nearly_unit_spaced_time_uses_exact_indexed_leads() -> None:
                 }
             )
     data = pd.DataFrame(rows)
+    with pytest.raises(ValueError, match="integer period identifiers"):
+        LocalProjection(horizons=1, covariance="hc1", sample="per_horizon").fit(
+            data,
+            outcome="y",
+            shock="shock",
+            unit="unit",
+            time="time",
+        )
+
+
+def test_integer_string_time_matches_integer_time_on_unbalanced_panel() -> None:
+    data = covariance_panel().query("not (unit == 0 and time == 3)").copy()
+    options = dict(
+        outcome="y",
+        shock="shock",
+        controls=["control"],
+        unit="unit",
+        time="time",
+    )
+    expected = LocalProjection(
+        horizons=2, covariance="hac", hac_lags=1, sample="per_horizon"
+    ).fit(data, **options)
+    string_time = data.copy()
+    string_time["time"] = string_time["time"].astype(str)
+    actual = LocalProjection(
+        horizons=2, covariance="hac", hac_lags=1, sample="per_horizon"
+    ).fit(string_time, **options)
+
+    np.testing.assert_allclose(actual.coef_, expected.coef_)
+    np.testing.assert_allclose(actual.covariance_, expected.covariance_)
+    assert actual.n_obs_by_horizon_.tolist() == expected.n_obs_by_horizon_.tolist()
+    assert actual.demeaning_diagnostics_["lead_path"] == "indexed"
+    np.testing.assert_array_equal(
+        actual.sample_index_by_horizon_[0], string_time.index.to_numpy()
+    )
+
+
+def test_large_native_integer_time_preserves_exact_leads() -> None:
+    data = balanced_panel()
+    data["time"] = data["time"].astype(np.int64) + (2**53 + 10)
     fitted = LocalProjection(
         horizons=1, covariance="hc1", sample="per_horizon"
     ).fit(
@@ -886,7 +1105,39 @@ def test_nearly_unit_spaced_time_uses_exact_indexed_leads() -> None:
         time="time",
     )
 
-    assert fitted.demeaning_diagnostics_["lead_path"] == "indexed"
-    assert fitted.n_obs_by_horizon_.tolist() == [16, 4]
-    expected_horizon_one = data.index[data["time"] == 0.0].tolist()
-    assert fitted.sample_index_by_horizon_[1].tolist() == expected_horizon_one
+    assert fitted.n_obs_by_horizon_.tolist() == [32, 28]
+    assert fitted.demeaning_diagnostics_["lead_path"] == "balanced_arithmetic"
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        [0.0, 1.0, float(2**53)],
+        ["0", "1", str(2**63)],
+        pd.date_range("2020-01-01", periods=3),
+    ],
+)
+def test_unsupported_time_representations_fail_clearly(values) -> None:
+    data = balanced_panel().query("unit == 0 and time < 3").copy()
+    data["time"] = values
+    with pytest.raises(ValueError, match="integer period identifiers"):
+        LocalProjection(horizons=0, covariance="hc1").fit(
+            data,
+            outcome="y",
+            shock="shock",
+            unit="unit",
+            time="time",
+        )
+
+
+def test_time_conversion_collision_is_rejected() -> None:
+    data = balanced_panel().query("unit == 0 and time < 2").copy()
+    data["time"] = ["01", "1"]
+    with pytest.raises(ValueError, match="uniquely identify"):
+        LocalProjection(horizons=0, covariance="hc1").fit(
+            data,
+            outcome="y",
+            shock="shock",
+            unit="unit",
+            time="time",
+        )

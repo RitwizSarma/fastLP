@@ -125,6 +125,22 @@ def test_polars_time_covariances_match_pandas(covariance: str) -> None:
     np.testing.assert_allclose(actual.stderr_, expected.stderr_, rtol=1e-11, atol=1e-11)
 
 
+def test_polars_integer_string_time_matches_pandas_canonical_clock() -> None:
+    pandas_data = panel().query("not (unit == 0 and time == 3)").copy()
+    pandas_data["time"] = pandas_data["time"].astype(str)
+    options = dict(outcome="y", shock="shock", unit="unit", time="time")
+    expected = LocalProjection(
+        horizons=2, covariance="hac", hac_lags=1, sample="per_horizon"
+    ).fit(pandas_data, **options)
+    actual = LocalProjection(
+        horizons=2, covariance="hac", hac_lags=1, sample="per_horizon"
+    ).fit(as_polars(pandas_data), **options)
+
+    np.testing.assert_allclose(actual.coef_, expected.coef_)
+    np.testing.assert_allclose(actual.covariance_, expected.covariance_)
+    assert actual.n_obs_by_horizon_.tolist() == expected.n_obs_by_horizon_.tolist()
+
+
 def test_polars_interaction_cluster_matches_pandas() -> None:
     pandas_data = panel()
     options = dict(

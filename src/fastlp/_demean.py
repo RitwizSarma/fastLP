@@ -90,15 +90,21 @@ class Residualizer:
                 "none",
                 np.zeros(values.shape[1], dtype=int),
             )
+        # Every nonempty categorical FE space contains the constant. Removing
+        # it first makes both scaling and convergence invariant to level shifts.
+        centered = values - values.mean(axis=0)
+        scales = np.max(np.abs(centered), axis=0)
+        scales[scales == 0.0] = 1.0
+        transformed = np.ascontiguousarray(centered / scales)
         if self._native is not None:
             acceleration_code = {"none": 0, "aitken": 1, "irons_tuck": 2}[acceleration]
             transformed, iterations, accepted = self._native.transform(
-                values, tol, max_iter, acceleration_code
+                transformed, tol, max_iter, acceleration_code
             )
             iterations = np.asarray(iterations, dtype=int)
             if (iterations < 0).any():
                 raise RuntimeError("fixed-effect demeaning did not converge")
-            return np.asarray(transformed), DemeanDiagnostics(
+            return np.asarray(transformed) * scales, DemeanDiagnostics(
                 iterations,
                 "rust",
                 f"symmetric_kaczmarz_{acceleration}"
@@ -107,7 +113,6 @@ class Residualizer:
                 np.asarray(accepted, dtype=int),
             )
 
-        transformed = values.copy()
         iterations = np.zeros(values.shape[1], dtype=int)
         accepted = np.zeros(values.shape[1], dtype=int)
         for column in range(transformed.shape[1]):
@@ -135,7 +140,10 @@ class Residualizer:
                         if np.isfinite(candidate).all() and self._projection_error(candidate) < self._projection_error(vector):
                             vector[:] = candidate
                             accepted[column] += 1
-                if np.max(np.abs(vector - previous)) < tol:
+                if (
+                    np.max(np.abs(vector - previous)) < tol
+                    and self._projection_error(vector) < tol
+                ):
                     iterations[column] = iteration
                     break
                 older[:] = previous
@@ -146,7 +154,7 @@ class Residualizer:
             if acceleration != "none"
             else "cyclic_kaczmarz"
         )
-        return transformed, DemeanDiagnostics(iterations, "numpy", method, accepted)
+        return transformed * scales, DemeanDiagnostics(iterations, "numpy", method, accepted)
 
     def _projection_error(self, vector: np.ndarray) -> float:
         """Largest remaining absolute group mean over every FE dimension."""

@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from numbers import Integral
-from statistics import NormalDist
+from math import isfinite
+from numbers import Integral, Real
 from typing import Any
 import warnings
 
 import numpy as np
 import pandas as pd
+from scipy.stats import norm as normal_dist
+from scipy.stats import t as student_t
 
 from ._covariance import (
     Kernel,
@@ -20,7 +22,10 @@ from ._covariance import (
     homoskedastic,
 )
 from ._demean import DemeanDiagnostics, Residualizer, balanced_demean, factorize_effects
+from ._degrees_of_freedom import cluster_parameter_count, effect_rank
 from ._frame import PanelFrame, prepare_panel
+from ._linalg import RegressionDesign
+from ._memory import input_size, plan_memory
 
 
 def _as_columns(value: str | Sequence[str] | None, name: str) -> tuple[str, ...]:
@@ -58,6 +63,35 @@ def _with_column_names(data: Any, column_names: Sequence[str] | None) -> Any:
 
 ClusterTerm = str | tuple[str, ...]
 _HORIZON_BATCH_SIZE = 32
+_MAX_SUPPORTED_LAG = int(np.iinfo(np.int64).max)
+_MAX_SCALAR_LAG_COUNT = 10_000
+
+
+def _require_finite(values: np.ndarray, stage: str) -> None:
+    """Reject numerical-range failures before publishing regression results."""
+    if not np.isfinite(values).all():
+        raise ValueError(
+            f"numerical range exceeded while computing {stage}; "
+            "nonfinite values encountered, rescale the model variables"
+        )
+
+
+def _cumulative_batch(
+    outcome: np.ndarray,
+    future_positions: np.ndarray,
+    positions: np.ndarray,
+    horizons: Sequence[int],
+    running: np.ndarray,
+    next_step: int,
+) -> tuple[np.ndarray, int]:
+    """Accumulate forward from each anchor, preserving state across batches."""
+    result = np.empty((len(positions), len(horizons)), dtype=np.float64)
+    for column, horizon in enumerate(horizons):
+        for step in range(next_step, horizon + 1):
+            running += outcome[future_positions[positions, step]]
+        result[:, column] = running
+        next_step = horizon + 1
+    return result, next_step
 
 
 class FewClustersWarning(UserWarning):
@@ -115,6 +149,39 @@ def _prune_singletons(
     return retained, initial - int(retained.sum()), rounds
 
 
+def _within_signal_floor(
+    n_obs: int,
+    effect_codes: np.ndarray,
+    effect_counts: np.ndarray,
+    *,
+    iterative: bool,
+    tolerance: float,
+) -> float:
+    """Normalized L2 signal below which FE absorption is numerically unresolved."""
+    if not effect_counts.size:
+        return 0.0
+    largest_group = max(
+        int(np.bincount(effect_codes[:, dimension]).max())
+        for dimension in range(effect_codes.shape[1])
+    )
+    accumulation_length = n_obs if len(effect_counts) > 1 else largest_group
+    roundoff = accumulation_length * np.finfo(np.float64).eps
+    if roundoff >= 1.0:
+        return np.inf
+    roundoff /= 1.0 - roundoff
+    per_observation_error = (len(effect_counts) + 1) * roundoff
+    if iterative:
+        per_observation_error += 10.0 * tolerance
+    return float(np.sqrt(n_obs) * per_observation_error)
+
+
+def _covariance_roundoff_multiplier(n_obs: int, n_features: int) -> float:
+    """Conservative gamma bound for score accumulation and sandwich products."""
+    operations = 2 * n_obs + 4 * n_features
+    product = operations * np.finfo(np.float64).eps
+    return np.inf if product >= 1.0 else product / (1.0 - product)
+
+
 def _exact_panel_demean(
     values: np.ndarray,
     frame: PanelFrame,
@@ -124,13 +191,19 @@ def _exact_panel_demean(
     time: str,
 ) -> tuple[np.ndarray, DemeanDiagnostics] | None:
     """Apply exact one-/two-way within transforms on a dense panel."""
-    if not effects or len(set(effects)) != len(effects) or not set(effects).issubset({unit, time}):
+    if (
+        not effects
+        or len(set(effects)) != len(effects)
+        or not set(effects).issubset({unit, time})
+    ):
         return None
+    values = np.asarray(values, dtype=np.float64)
+    values = values - values.mean(axis=0)
     shape = _balanced_panel_shape(frame, unit, time)
     if len(effects) == 1 and shape is None:
         codes, n_groups = frame.factorize((effects[0],))
         counts = np.bincount(codes, minlength=n_groups).astype(np.float64)
-        transformed = np.asarray(values, dtype=np.float64).copy()
+        transformed = values.copy()
         for column in range(transformed.shape[1]):
             sums = np.bincount(codes, weights=transformed[:, column], minlength=n_groups)
             transformed[:, column] -= sums[codes] / counts[codes]
@@ -205,6 +278,13 @@ def _as_lag_numbers(value: int | Sequence[int], name: str) -> tuple[int, ...]:
     if isinstance(value, Integral) and not isinstance(value, bool):
         if value < 0:
             raise ValueError(f"{name} must be non-negative")
+        if value > _MAX_SUPPORTED_LAG:
+            raise ValueError(f"{name} must not exceed the int64 lag limit")
+        if value > _MAX_SCALAR_LAG_COUNT:
+            raise ValueError(
+                f"{name} scalar lag count must not exceed {_MAX_SCALAR_LAG_COUNT}; "
+                "use a sequence for sparse, larger lag numbers"
+            )
         return tuple(range(1, int(value) + 1))
     if isinstance(value, str):
         raise ValueError(f"{name} must be an integer or a sequence of positive integers")
@@ -214,6 +294,8 @@ def _as_lag_numbers(value: int | Sequence[int], name: str) -> tuple[int, ...]:
         raise ValueError(f"{name} must be an integer or a sequence of positive integers") from error
     if any(not isinstance(lag, Integral) or isinstance(lag, bool) or lag < 1 for lag in lags):
         raise ValueError(f"{name} must contain only positive integers")
+    if any(lag > _MAX_SUPPORTED_LAG for lag in lags):
+        raise ValueError(f"{name} must not exceed the int64 lag limit")
     if len(set(lags)) != len(lags):
         raise ValueError(f"{name} must not contain duplicate lags")
     return tuple(int(lag) for lag in lags)
@@ -241,10 +323,10 @@ def _lag_requests(
 
 
 def _add_lags(
-    frame: PanelFrame, unit: str, requests: Sequence[tuple[str, int]]
-) -> tuple[PanelFrame, tuple[str, ...], np.ndarray]:
-    """Generate within-unit row lags and identify rows valid as LP anchors."""
-    return frame.add_lags(unit, requests)
+    frame: PanelFrame, unit: str, time: str, requests: Sequence[tuple[str, int]]
+) -> tuple[PanelFrame, tuple[str, ...], np.ndarray, str]:
+    """Generate exact within-unit calendar lags and valid LP anchors."""
+    return frame.add_lags(unit, time, requests)
 
 
 class LocalProjection:
@@ -272,8 +354,12 @@ class LocalProjection:
         demean_acceleration: str = "irons_tuck",
         few_cluster_threshold: int | None = 50,
         singleton_policy: str = "drop",
+        fe_dof: str = "exact",
+        cluster_df: str = "nonnested",
+        cluster_group_adjustment: str = "min",
+        cluster_inference: str = "t",
     ) -> None:
-        if not isinstance(horizons, int) or horizons < 0:
+        if not isinstance(horizons, Integral) or isinstance(horizons, bool) or horizons < 0:
             raise ValueError("horizons must be a non-negative integer")
         allowed_covariance = {
             "homoskedastic",
@@ -287,7 +373,11 @@ class LocalProjection:
         }
         if covariance not in allowed_covariance:
             raise ValueError(f"covariance must be one of {sorted(allowed_covariance)}")
-        if hac_lags is not None and (not isinstance(hac_lags, int) or hac_lags < 0):
+        if hac_lags is not None and (
+            not isinstance(hac_lags, Integral)
+            or isinstance(hac_lags, bool)
+            or hac_lags < 0
+        ):
             raise ValueError("hac_lags must be a non-negative integer or None")
         if hac_kernel not in {"bartlett", "parzen", "quadratic_spectral"}:
             raise ValueError("hac_kernel must be 'bartlett', 'parzen', or 'quadratic_spectral'")
@@ -295,10 +385,19 @@ class LocalProjection:
             raise ValueError("hac_debias must be a boolean")
         if cluster_correction not in {"cr0", "cr1"}:
             raise ValueError("cluster_correction must be 'cr0' or 'cr1'")
-        if not 0 < alpha < 1:
+        if not isinstance(alpha, Real) or isinstance(alpha, bool) or not 0 < alpha < 1:
             raise ValueError("alpha must be between zero and one")
-        if demean_tol <= 0 or max_iter < 1:
-            raise ValueError("demean_tol must be positive and max_iter must be at least one")
+        if float(alpha) / 2 == 0:
+            raise ValueError("alpha is too small for float64 tail probabilities")
+        if (
+            not isinstance(demean_tol, Real)
+            or isinstance(demean_tol, bool)
+            or not isfinite(demean_tol)
+            or demean_tol <= 0
+        ):
+            raise ValueError("demean_tol must be finite and positive")
+        if not isinstance(max_iter, Integral) or isinstance(max_iter, bool) or max_iter < 1:
+            raise ValueError("max_iter must be a positive integer")
         if sample not in {"common", "per_horizon"}:
             raise ValueError("sample must be 'common' or 'per_horizon'")
         if response not in {"level", "cumulative"}:
@@ -317,15 +416,23 @@ class LocalProjection:
             raise ValueError("few_cluster_threshold must be at least two or None")
         if singleton_policy not in {"drop", "keep"}:
             raise ValueError("singleton_policy must be 'drop' or 'keep'")
-        self.horizons = horizons
+        if fe_dof not in {"exact", "conservative"}:
+            raise ValueError("fe_dof must be 'exact' or 'conservative'")
+        if cluster_df not in {"nonnested", "full", "none"}:
+            raise ValueError("cluster_df must be 'nonnested', 'full', or 'none'")
+        if cluster_group_adjustment not in {"min", "component"}:
+            raise ValueError("cluster_group_adjustment must be 'min' or 'component'")
+        if cluster_inference not in {"t", "normal"}:
+            raise ValueError("cluster_inference must be 't' or 'normal'")
+        self.horizons = int(horizons)
         self.covariance = covariance
-        self.hac_lags = hac_lags
+        self.hac_lags = None if hac_lags is None else int(hac_lags)
         self.hac_kernel = hac_kernel
         self.hac_debias = hac_debias
         self.cluster_correction = cluster_correction
-        self.alpha = alpha
-        self.demean_tol = demean_tol
-        self.max_iter = max_iter
+        self.alpha = float(alpha)
+        self.demean_tol = float(demean_tol)
+        self.max_iter = int(max_iter)
         self.sample = sample
         self.response = response
         self.retain_residuals = retain_residuals
@@ -335,6 +442,10 @@ class LocalProjection:
             None if few_cluster_threshold is None else int(few_cluster_threshold)
         )
         self.singleton_policy = singleton_policy
+        self.fe_dof = fe_dof
+        self.cluster_df = cluster_df
+        self.cluster_group_adjustment = cluster_group_adjustment
+        self.cluster_inference = cluster_inference
 
     def fit(
         self,
@@ -361,9 +472,17 @@ class LocalProjection:
         A scalar lag setting includes all lags from one through that value;
         sequences select an arbitrary positive lag grid.  For shocks and
         controls, a mapping can assign a separate setting to each column.
-        Lags are generated automatically from preceding, sorted observations
-        within each unit. Rows without every requested lag are not used as LP
-        anchors, but remain available as future outcomes.
+        Lag numbers must fit in signed int64; scalar lag counts are limited
+        to 10,000 to avoid expanding an impractically large feature grid.
+        Lags use exact within-unit calendar matches at ``time - lag``. Rows
+        without every requested lag are not used as LP anchors, but remain
+        available as future outcomes.
+
+        ``memory_budget`` bounds a conservative allocation plan for owned
+        frames, alignment, results and numerical workspaces. Too-small budgets
+        fail before panel preparation; remaining space determines batch size.
+        It is not a process-RSS limit: caller input, Python/allocator overhead
+        and private library workspaces are excluded.
         """
         data = _with_column_names(data, column_names)
         shocks = _as_columns(shock, "shock")
@@ -371,6 +490,12 @@ class LocalProjection:
             raise ValueError("shock must be a column name or a non-empty sequence of column names")
         controls = _as_columns(controls, "controls")
         effects = _as_columns(fixed_effects, "fixed_effects")
+        if effects and self.covariance in {"hc2", "hc3"}:
+            raise ValueError(
+                "HC2 and HC3 are not supported with fixed effects because exact "
+                "full-model leverage is not yet available; use covariance='hc0' "
+                "or covariance='hc1'"
+            )
         cluster_terms = _as_cluster_terms(cluster) if cluster is not None else ()
         required = (outcome, unit, time, *shocks, *controls, *effects)
         if self.covariance == "cluster":
@@ -389,8 +514,26 @@ class LocalProjection:
         )
 
         numeric_columns = (outcome, *shocks, *controls)
+        memory_plan = None
+        planned_batch = _HORIZON_BATCH_SIZE
+        if self.memory_budget is not None:
+            rows, frame_bytes = input_size(data, required)
+            memory_plan = plan_memory(
+                budget=self.memory_budget, rows=rows, frame_bytes=frame_bytes,
+                features=len(shocks) + len(controls) + len(set(lag_requests)) + int(not effects),
+                horizons=self.horizons, lag_features=len(set(lag_requests)),
+                effects=len(effects), cluster_terms=len(cluster_terms),
+                retain_residuals=self.retain_residuals, covariance=self.covariance,
+                kernel=self.hac_kernel, exact_rank=self.fe_dof == "exact",
+                hac_lags=self.hac_lags,
+            )
+            planned_batch = memory_plan.batch_size(
+                min(_HORIZON_BATCH_SIZE, self.horizons + 1)
+            )
         frame, input_was_sorted = prepare_panel(data, required, numeric_columns)
-        frame, lag_feature_names, valid_lag_rows = _add_lags(frame, unit, lag_requests)
+        frame, lag_feature_names, valid_lag_rows, lag_path = _add_lags(
+            frame, unit, time, lag_requests
+        )
         if not len(frame):
             raise ValueError("data must contain at least one panel unit")
         future_positions, lead_path = self._lead_positions(frame, unit=unit, time=time)
@@ -421,14 +564,6 @@ class LocalProjection:
             base_x = np.column_stack((np.ones(len(frame), dtype=np.float64), base_x))
         feature_names = ("Intercept", *base_features) if not effects else base_features
         outcome_values = frame.column(outcome).astype(np.float64, copy=False)
-        outcome_prefix = None
-        dense_shape = _balanced_panel_shape(frame, unit, time)
-        if self.response == "cumulative" and lead_path == "balanced_arithmetic":
-            assert dense_shape is not None
-            outcome_grid = outcome_values.reshape(dense_shape)
-            outcome_prefix = np.column_stack(
-                (np.zeros(dense_shape[0], dtype=np.float64), np.cumsum(outcome_grid, axis=1))
-            )
         groups: dict[bytes, list[int]] = {}
         group_masks: list[np.ndarray] = []
         for horizon in range(self.horizons + 1):
@@ -454,6 +589,10 @@ class LocalProjection:
         x_iterations_by_group: list[np.ndarray] = []
         acceleration_accepted_by_group: list[np.ndarray] = []
         linear_algebra_by_group: list[dict[str, object]] = []
+        degrees_of_freedom_by_group: list[dict[str, object]] = []
+        model_ranks = np.empty(n_horizons, dtype=int)
+        correction_ranks = np.empty(n_horizons, dtype=int)
+        inference_df = np.full(n_horizons, np.inf)
         backends: list[str] = []
         methods: list[str] = []
         warned_cluster_terms: set[str] = set()
@@ -464,9 +603,79 @@ class LocalProjection:
             positions = np.flatnonzero(mask)
             anchor = frame.take(positions)
             x = base_x[mask]
+            effect_codes, effect_counts = factorize_effects(anchor, effects)
+            # Rank depends on the final retained sample, but not on residualized
+            # values. Resolve it before potentially expensive FE absorption so
+            # an over-budget exact multiway calculation fails immediately.
+            absorbed = effect_rank(effect_codes, effect_counts, mode=self.fe_dof)
+            model_rank = n_features + absorbed.rank
+            if len(anchor) <= model_rank:
+                qualification = "" if absorbed.exact else " under the conservative rank bound"
+                raise ValueError(
+                    f"residual degrees of freedom must be positive{qualification} "
+                    f"at horizon {horizons[0]} (n={len(anchor)}, model rank={model_rank})"
+                )
+            correction_rank = model_rank
+            nested_effects: tuple[int, ...] = ()
+            correction_effect_rank = absorbed
+            cluster_data = None
+            if self.covariance == "cluster":
+                if cluster_terms == ((unit,),):
+                    unit_sizes = anchor.group_sizes(unit)
+                    cluster_codes = [
+                        np.repeat(np.arange(len(unit_sizes), dtype=np.int64), unit_sizes)
+                    ]
+                    labels = [unit]
+                else:
+                    cluster_codes, labels = factorize_cluster_terms(anchor, cluster_terms)
+                cluster_data = (cluster_codes, labels)
+                correction_rank, nested_effects, correction_effect_rank = cluster_parameter_count(
+                    n_features, effect_codes, effect_counts, cluster_codes,
+                    policy=self.cluster_df, full_rank=absorbed, mode=self.fe_dof,
+                )
+                if self.cluster_correction == "cr1" and len(anchor) <= correction_rank:
+                    raise ValueError(
+                        "cluster correction requires positive degrees of freedom "
+                        "under the selected parameter-count policy"
+                    )
+                if self.cluster_inference == "t":
+                    inference_df[horizons] = min(int(codes.max()) for codes in cluster_codes)
+                if self.few_cluster_threshold is not None:
+                    for codes, label in zip(cluster_codes, labels, strict=True):
+                        n_clusters = int(codes.max()) + 1
+                        if (
+                            n_clusters < self.few_cluster_threshold
+                            and label not in warned_cluster_terms
+                        ):
+                            warnings.warn(
+                                f"cluster term {label!r} has only {n_clusters} clusters; "
+                                "cluster-robust inference may be unreliable, and CR1 does "
+                                "not eliminate the few-cluster problem",
+                                FewClustersWarning,
+                                stacklevel=2,
+                            )
+                            warned_cluster_terms.add(label)
+
+            model_ranks[horizons] = model_rank
+            correction_ranks[horizons] = correction_rank
+            degrees_of_freedom_by_group.append(
+                {
+                    "horizons": tuple(horizons),
+                    "n_obs": len(anchor),
+                    "absorbed_rank": absorbed.rank,
+                    "model_rank": model_rank,
+                    "df_resid": len(anchor) - model_rank,
+                    "exact": absorbed.exact,
+                    "method": absorbed.method,
+                    "correction_rank": correction_rank,
+                    "correction_rank_exact": correction_effect_rank.exact,
+                    "correction_rank_method": correction_effect_rank.method,
+                    "nested_effects": tuple(effects[index] for index in nested_effects),
+                }
+            )
+
             exact_x = _exact_panel_demean(x, anchor, effects, unit=unit, time=time)
             if exact_x is None:
-                effect_codes, effect_counts = factorize_effects(anchor, effects)
                 residualizer = Residualizer(effect_codes, effect_counts)
                 x_tilde, x_diag = residualizer.transform(
                     x,
@@ -478,9 +687,25 @@ class LocalProjection:
                 residualizer = None
                 x_tilde, x_diag = exact_x
             column_scales = np.linalg.norm(x_tilde, axis=0)
-            raw_column_scales = np.linalg.norm(x, axis=0)
-            scale_floor = np.sqrt(np.finfo(np.float64).eps) * raw_column_scales
-            weak_columns = (~np.isfinite(column_scales)) | (column_scales <= scale_floor)
+            centered_x = x - x.mean(axis=0)
+            input_scales = np.max(np.abs(centered_x), axis=0)
+            safe_input_scales = np.where(input_scales == 0.0, 1.0, input_scales)
+            normalized_within_norms = np.linalg.norm(
+                x_tilde / safe_input_scales, axis=0
+            )
+            within_signal_floor = _within_signal_floor(
+                len(anchor),
+                effect_codes,
+                effect_counts,
+                iterative=residualizer is not None and bool(effects),
+                tolerance=self.demean_tol,
+            )
+            weak_columns = (
+                (~np.isfinite(column_scales))
+                | (~np.isfinite(normalized_within_norms))
+                | (column_scales == 0.0)
+                | (normalized_within_norms <= within_signal_floor)
+            )
             if weak_columns.any():
                 names = [feature_names[index] for index in np.flatnonzero(weak_columns)]
                 raise ValueError(
@@ -488,90 +713,18 @@ class LocalProjection:
                     f"horizon {horizons[0]} for columns {names}"
                 )
 
-            # Equilibrate the design before forming cross-products.  All
-            # reported coefficients and covariance matrices are transformed
-            # back to the original feature units below.
-            x_tilde /= column_scales
-            gram = x_tilde.T @ x_tilde
-            gram = (gram + gram.T) / 2
-            try:
-                eigenvalues = np.linalg.eigvalsh(gram)
-            except np.linalg.LinAlgError as error:
-                raise ValueError(
-                    f"could not assess the scaled design at horizon {horizons[0]}; "
-                    "the small Gram-matrix eigendecomposition did not converge"
-                ) from error
-            largest_eigenvalue = float(eigenvalues[-1])
-            rank_tolerance = (
-                np.finfo(np.float64).eps * gram.shape[0] * largest_eigenvalue
-            )
-            rank = int(np.count_nonzero(eigenvalues > rank_tolerance))
-            smallest_eigenvalue = float(eigenvalues[0])
-            gram_condition = (
-                largest_eigenvalue / smallest_eigenvalue
-                if smallest_eigenvalue > 0.0
-                else np.inf
-            )
-            design_condition = float(np.sqrt(gram_condition))
-            linear_algebra_by_group.append(
-                {
-                    "horizon": int(horizons[0]),
-                    "rank": rank,
-                    "n_features": int(x_tilde.shape[1]),
-                    "rank_tolerance": float(rank_tolerance),
-                    "scaled_gram_condition_number": float(gram_condition),
-                    "scaled_design_condition_number": design_condition,
-                    "column_scales": column_scales.copy(),
-                }
-            )
-            if rank != x_tilde.shape[1]:
-                raise ValueError(
-                    f"residualized design is numerically rank deficient at horizon "
-                    f"{horizons[0]} (rank {rank} of {x_tilde.shape[1]}; scaled-design "
-                    f"condition number {design_condition:.3g})"
-                )
-            if len(anchor) <= rank:
-                raise ValueError("residual degrees of freedom must be positive")
-            try:
-                chol = np.linalg.cholesky(gram)
-            except np.linalg.LinAlgError as error:
-                raise ValueError(
-                    f"Cholesky factorization of the scaled Gram matrix failed at "
-                    f"horizon {horizons[0]} despite an estimated rank of {rank}; "
-                    f"the residualized design may be ill-conditioned "
-                    f"(estimated scaled-design condition number "
-                    f"{design_condition:.3g})"
-                ) from error
-            bread = np.linalg.solve(chol.T, np.linalg.solve(chol, np.eye(rank)))
-            cluster_data = None
-            if self.covariance == "cluster":
-                if cluster_terms == ((unit,),):
-                    unit_sizes = anchor.group_sizes(unit)
-                    cluster_codes = [np.repeat(np.arange(len(unit_sizes), dtype=np.int64), unit_sizes)]
-                    labels = [unit]
-                else:
-                    cluster_codes, labels = factorize_cluster_terms(anchor, cluster_terms)
-                cluster_data = (cluster_codes, labels)
-                if self.few_cluster_threshold is not None:
-                    for codes, label in zip(cluster_codes, labels, strict=True):
-                        n_clusters = int(codes.max()) + 1
-                        if n_clusters < self.few_cluster_threshold and label not in warned_cluster_terms:
-                            warnings.warn(
-                                f"cluster term {label!r} has only {n_clusters} clusters; "
-                                "cluster-robust inference may be unreliable, and CR1 does "
-                                "not eliminate the few-cluster problem",
-                                FewClustersWarning,
-                                stacklevel=2,
-                            )
-                            warned_cluster_terms.add(label)
+            design = RegressionDesign(x_tilde, horizon=horizons[0], column_scales=column_scales)
+            design.diagnostics["normalized_within_norms"] = normalized_within_norms.copy()
+            design.diagnostics["within_signal_floor"] = within_signal_floor
+            x_tilde, bread = design.x, design.bread
+            linear_algebra_by_group.append(design.diagnostics)
 
-            # Budget for raw outcomes, transformed outcomes, and residuals.
-            bytes_per_horizon = max(1, len(anchor) * np.dtype(np.float64).itemsize * 3)
-            budget_batch = (
-                len(horizons) if self.memory_budget is None
-                else max(1, self.memory_budget // bytes_per_horizon)
+            batch_size = min(planned_batch, len(horizons))
+            running_outcome = (
+                np.zeros(len(anchor), dtype=np.float64)
+                if self.response == "cumulative" else None
             )
-            batch_size = max(1, min(_HORIZON_BATCH_SIZE, int(budget_batch)))
+            next_step = 0
             for batch_start in range(0, len(horizons), batch_size):
                 batch_horizons = horizons[batch_start : batch_start + batch_size]
                 if self.response == "level":
@@ -579,29 +732,12 @@ class LocalProjection:
                         [outcome_values[future_positions[mask, horizon]] for horizon in batch_horizons]
                     )
                 else:
-                    if outcome_prefix is not None and dense_shape is not None:
-                        anchor_positions = positions
-                        anchor_units = anchor_positions // dense_shape[1]
-                        anchor_times = anchor_positions % dense_shape[1]
-                        y = np.column_stack(
-                            [
-                                outcome_prefix[anchor_units, anchor_times + horizon + 1]
-                                - outcome_prefix[anchor_units, anchor_times]
-                                for horizon in batch_horizons
-                            ]
-                        )
-                    else:
-                        y = np.column_stack(
-                            [
-                                np.sum(
-                                    np.column_stack(
-                                        [outcome_values[future_positions[mask, step]] for step in range(horizon + 1)]
-                                    ),
-                                    axis=1,
-                                )
-                                for horizon in batch_horizons
-                            ]
-                        )
+                    assert running_outcome is not None
+                    y, next_step = _cumulative_batch(
+                        outcome_values, future_positions, positions,
+                        batch_horizons, running_outcome, next_step,
+                    )
+                _require_finite(y, "regression outcomes")
                 if residualizer is None:
                     exact_y = _exact_panel_demean(y, anchor, effects, unit=unit, time=time)
                     assert exact_y is not None
@@ -613,29 +749,43 @@ class LocalProjection:
                         max_iter=self.max_iter,
                         acceleration=self.demean_acceleration,
                     )
-                scaled_coef = np.linalg.solve(
-                    chol.T, np.linalg.solve(chol, x_tilde.T @ y_tilde)
-                )
-                residuals = y_tilde - x_tilde @ scaled_coef
+                _require_finite(y_tilde, "transformed outcomes")
+                coef, residuals = design.solve(y_tilde)
+                _require_finite(coef, "coefficients")
+                _require_finite(residuals, "residuals")
                 if self.covariance == "homoskedastic":
-                    covariance = homoskedastic(x_tilde, residuals, bread)
+                    covariance = homoskedastic(x_tilde, residuals, bread, model_rank=model_rank)
                     covariance_diagnostics = tuple(
                         {"kind": "homoskedastic"} for _ in batch_horizons
                     )
                 elif self.covariance in {"hc0", "hc1", "hc2", "hc3"}:
-                    covariance = hc(x_tilde, residuals, bread, self.covariance)
+                    covariance = hc(x_tilde, residuals, bread, self.covariance, model_rank=model_rank)
                     covariance_diagnostics = tuple(
                         {"kind": self.covariance} for _ in batch_horizons
                     )
                 elif self.covariance == "cluster":
                     assert cluster_data is not None
-                    covariance, cluster_diagnostics = cluster_covariance(
-                        x_tilde, residuals, *cluster_data, bread, self.cluster_correction
+                    (
+                        covariance,
+                        cluster_diagnostics,
+                        covariance_roundoff_scale,
+                    ) = cluster_covariance(
+                        x_tilde,
+                        residuals,
+                        *cluster_data,
+                        bread,
+                        self.cluster_correction,
+                        correction_rank=correction_rank,
+                        group_adjustment=self.cluster_group_adjustment,
+                        return_roundoff_scale=True,
                     )
                     covariance_diagnostics = tuple(
                         {
                             "kind": "cluster",
                             "correction": self.cluster_correction,
+                            "correction_rank": correction_rank,
+                            "parameter_count": self.cluster_df,
+                            "group_adjustment": self.cluster_group_adjustment,
                             "components": cluster_diagnostics,
                         }
                         for _ in batch_horizons
@@ -650,27 +800,47 @@ class LocalProjection:
                         bread,
                         max_lags=self.hac_lags, kernel=self.hac_kernel, debias=self.hac_debias,
                         driscoll_kraay=self.covariance == "driscoll_kraay",
+                        model_rank=model_rank,
+                        stream_pairs=memory_plan.stream_pairs if memory_plan is not None else False,
                     )
-                inverse_scales = 1.0 / column_scales
-                coef = scaled_coef * inverse_scales[:, None]
-                covariance *= inverse_scales[None, :, None]
-                covariance *= inverse_scales[None, None, :]
+                covariance = design.covariance_in_scaled_feature_units(covariance)
                 covariance = (covariance + covariance.transpose(0, 2, 1)) / 2
+                _require_finite(covariance, "normalized covariance")
                 diagonal = np.diagonal(covariance, axis1=1, axis2=2)
-                covariance_scale = np.maximum(
-                    np.max(np.abs(covariance), axis=(1, 2)), 1.0
-                )
-                materially_negative = (
-                    diagonal
-                    < -np.finfo(float).eps * covariance_scale[:, None] * 100
-                )
+                if self.covariance == "cluster":
+                    covariance_roundoff_scale = (
+                        design.covariance_error_in_scaled_feature_units(
+                            covariance_roundoff_scale
+                        )
+                    )
+                    diagonal_scale = np.diagonal(
+                        covariance_roundoff_scale, axis1=1, axis2=2
+                    )
+                else:
+                    diagonal_scale = np.max(np.abs(covariance), axis=(1, 2))[:, None]
+                negative_tolerance = _covariance_roundoff_multiplier(
+                    len(anchor), n_features
+                ) * diagonal_scale
+                materially_negative = diagonal < -negative_tolerance
                 if materially_negative.any():
                     local_horizon, feature = np.argwhere(materially_negative)[0]
                     raise ValueError(
                         f"{self.covariance} covariance has a negative variance at horizon "
                         f"{batch_horizons[int(local_horizon)]}, feature {int(feature)}"
                     )
-                stderr = np.sqrt(np.maximum(diagonal, 0.0))
+                for column in range(len(batch_horizons)):
+                    features = tuple(np.flatnonzero(diagonal[column] < 0.0).tolist())
+                    if features:
+                        covariance[column, features, features] = 0.0
+                    covariance_diagnostics[column]["negative_variance_cleanup"] = (
+                        features
+                    )
+                covariance = design.covariance_from_scaled_feature_units(covariance)
+                covariance = (covariance + covariance.transpose(0, 2, 1)) / 2
+                diagonal = np.diagonal(covariance, axis1=1, axis2=2)
+                stderr = np.sqrt(diagonal)
+                _require_finite(covariance, "covariance in original units")
+                _require_finite(stderr, "standard errors")
                 coefficients[batch_horizons] = coef.T
                 standard_errors[batch_horizons] = stderr
                 covariances[batch_horizons] = covariance
@@ -686,20 +856,42 @@ class LocalProjection:
             backends.append(x_diag.backend)
             methods.append(x_diag.method)
 
-        z_value = NormalDist().inv_cdf(1 - self.alpha / 2)
+        tail_probability = self.alpha / 2
+        critical_values = np.full(n_horizons, normal_dist.isf(tail_probability))
+        finite_df = np.isfinite(inference_df)
+        critical_values[finite_df] = student_t.isf(
+            tail_probability, inference_df[finite_df]
+        )
+        _require_finite(critical_values, "confidence critical values")
+        confidence_intervals = np.stack(
+            (coefficients - critical_values[:, None] * standard_errors,
+             coefficients + critical_values[:, None] * standard_errors), axis=-1
+        )
+        _require_finite(confidence_intervals, "confidence intervals")
         sample_indices = tuple(frame.sample_ids(mask) for mask in masks.T)
         self.coef_ = coefficients
         self.stderr_ = standard_errors
         self.covariance_ = covariances
-        self.conf_int_ = np.stack(
-            (coefficients - z_value * standard_errors, coefficients + z_value * standard_errors), axis=-1
-        )
+        self.conf_int_ = confidence_intervals
         self.horizons_ = np.arange(n_horizons)
         self.feature_names_in_ = np.asarray(feature_names, dtype=object)
         self.shock_names_in_ = np.asarray(shocks, dtype=object)
         self.sample_ = self.sample
         self.response_ = self.response
         self.n_obs_by_horizon_ = masks.sum(axis=0, dtype=int)
+        self.model_rank_by_horizon_ = model_ranks
+        self.df_resid_by_horizon_ = self.n_obs_by_horizon_ - model_ranks
+        self.correction_rank_by_horizon_ = correction_ranks
+        self.inference_df_by_horizon_ = inference_df
+        self.critical_values_ = critical_values
+        self.degrees_of_freedom_diagnostics_ = {
+            "policy": self.fe_dof,
+            "by_cache_group": tuple(degrees_of_freedom_by_group),
+        }
+        self.memory_diagnostics_ = (
+            memory_plan.diagnostics(planned_batch) if memory_plan is not None
+            else {"budget_bytes": None, "scope": "unbudgeted"}
+        )
         self.n_obs_ = int(self.n_obs_by_horizon_.max())
         self.n_units_ = frame.nunique(unit)
         self.n_periods_ = frame.nunique(time)
@@ -718,6 +910,9 @@ class LocalProjection:
             "kind": self.covariance,
             "cluster_terms": tuple("#".join(term) for term in cluster_terms),
             "cluster_correction": self.cluster_correction if self.covariance == "cluster" else None,
+            "cluster_df": self.cluster_df if self.covariance == "cluster" else None,
+            "cluster_group_adjustment": self.cluster_group_adjustment if self.covariance == "cluster" else None,
+            "cluster_inference": self.cluster_inference if self.covariance == "cluster" else None,
             "few_cluster_threshold": self.few_cluster_threshold if self.covariance == "cluster" else None,
             "hac_lags": self.hac_lags if self.covariance in {"hac", "driscoll_kraay"} else None,
             "hac_kernel": self.hac_kernel if self.covariance in {"hac", "driscoll_kraay"} else None,
@@ -730,7 +925,9 @@ class LocalProjection:
             "rounds_by_horizon": singleton_rounds,
         }
         self.linear_algebra_diagnostics_ = {
-            "solver": "scaled_cholesky",
+            "solver": linear_algebra_by_group[0]["solver"] if len({
+                item["solver"] for item in linear_algebra_by_group
+            }) == 1 else "mixed",
             "by_cache_group": tuple(linear_algebra_by_group),
         }
         self._irfplot = None
@@ -748,6 +945,7 @@ class LocalProjection:
             "cache_mode": "shared_design" if len(group_masks) == 1 else "mask_grouped",
             "input_was_sorted": input_was_sorted,
             "input_backend": frame.backend,
+            "lag_path": lag_path,
             "lead_path": lead_path,
             "batch_size": batch_size,
             "acceleration": self.demean_acceleration,
