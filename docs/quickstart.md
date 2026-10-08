@@ -30,8 +30,13 @@ data["y"] = (
 )
 ```
 
-Every `(unit, time)` pair must be unique. Panels may be unbalanced, and
-horizons are exact time leads: horizon `h` uses the outcome at `time + h`.
+Every `(unit, time)` pair must be unique. Use a finite, integer-valued period
+index for `time`, with the index advancing by one per underlying period (for
+example, `0, 1, 2, ...`). Panels may be unbalanced and therefore may contain
+gaps in that index. Horizons are exact time leads: horizon `h` uses the outcome
+at `time + h`, so a missing target period is not replaced by the next observed
+row. For monthly or quarterly data, construct a sequential period index rather
+than using decimal labels such as `2020.1` or `2020.2`.
 
 ## Fit local projections
 
@@ -116,6 +121,22 @@ Clustered inference requires `cluster=` in `fit()`. HAC and Driscoll--Kraay
 require integral numeric time labels. fastLP warns when a clustering dimension
 has fewer than 50 groups by default; that warning identifies a limitation of
 cluster asymptotics.
+
+## Memory budgeting
+
+`LocalProjection(memory_budget="1GB")` checks a conservative allocation plan
+before panel preparation. The plan includes selected-frame copies, lag columns,
+lead alignment, sample masks, retained results, and numerical workspaces. The
+remaining allowance determines horizon batch size; tight budgets can also
+stream HAC lag pairs. Budgets below the planned minimum raise `ValueError`
+instead of silently being exceeded. Inspect `lp.memory_diagnostics_` after a
+successful fit for the planned minimum, peak, and selected batch size.
+
+This is a bound on the **allocation plan**, not a hard process-memory cap.
+Caller-owned input, Python/allocator overhead and private library workspaces
+are excluded; conservative estimates may reject a fit that would happen to
+use less memory. Lazy Polars inputs require an additional aggregate pass for
+sizing. Leave `memory_budget=None` to retain the unbudgeted execution path.
 
 ## Other input backends
 

@@ -27,6 +27,7 @@ dependencies = [
     "matplotlib>=3.9",
     "numpy>=2.0",
     "pandas>=2.2",
+    "scipy>=1.13",
 ]
 
 [project.optional-dependencies]
@@ -57,7 +58,9 @@ include = [
 [dependency-groups]
 dev = [
     "ipykernel>=7.3.0",
+    "linearmodels>=7.0",
     "pytest>=8.0",
+    "statsmodels>=0.14",
     "twine>=7.0.0",
 ]
 docs = [

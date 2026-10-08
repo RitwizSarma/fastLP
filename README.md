@@ -52,8 +52,11 @@ lp.fit(
 ```
 
 Make sure you explicitly indicate the fixed effects specification. `fastLP`
-does _not_ implicitly use unit- or time-fixed effects. For multi-way fixed
-effects, use a tuple like `fixed_effects=["unit", ("quarter", "zipcode")]`.
+does _not_ implicitly use unit- or time-fixed effects. Supply multiple column
+names for additive multi-way fixed effects, for example
+`fixed_effects=["unit", "time"]`. Interacted fixed effects are not currently
+declared through nested tuples; create the interaction as a column first and
+pass that column's name instead.
 
 Retrieve the results and plot the shock response:
 

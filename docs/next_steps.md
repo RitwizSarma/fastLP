@@ -3,6 +3,36 @@
 ## Basic and obvious features
 
 1. `numpy` arrays as input. Duh.
+2. Validate that the `time` column contains finite integer-valued period
+   indices. Its scale must advance by one for each underlying period because
+   horizon `h` is defined by matching `time + h`. Gaps may remain in an
+   unbalanced panel, but labels such as quarterly decimals must be rejected in
+   favor of a sequential period index.
+
+## Common-sample attrition diagnostics
+
+Using one common sample across horizons enables fastLP's shared-design
+optimization and makes horizon estimates directly comparable, but the sample
+is selected by having valid outcomes through the maximum horizon. In an
+unbalanced panel or with nonrandom missingness, that restriction may leave a
+systematically different estimation population and therefore change the
+estimand. Descriptive balance checks cannot establish or rule out selection
+bias, but they should make potentially important sample changes visible.
+
+Whenever `sample="common"` is used, report diagnostics comparing the original
+eligible sample with the retained common sample. At minimum, show:
+
+- observations, units, and periods retained, with counts and percentages;
+- retention rates by unit and time period;
+- means, standard deviations, medians, and selected quantiles for the outcome,
+  shock, and controls in both samples; and
+- differences in means and standardized mean differences, with a warning when
+  attrition is substantial or covariate balance changes materially.
+
+Store the full comparison in fitted-result metadata and expose a tidy table for
+programmatic use. The ordinary fit summary should display a compact retention
+and balance summary so users do not have to opt into discovering that the
+common-sample restriction materially changed their data.
 
 ## Inference: broaden error calculations without narrowing LP specifications
 
