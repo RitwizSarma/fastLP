@@ -294,12 +294,13 @@ def main() -> None:
                 reference_call = lambda: fit_independent_horizons(
                     reference_data, horizons=horizons, covariance=args.covariance, fixed_effects=effects, cluster=cluster, controls=controls
                 )
-                if args.baseline:
-                    baseline = measure(reference_call, stage_timing=False)
-                else:
+                try:
+                    baseline = measure(reference_call, stage_timing=False) if args.baseline else None
+                    reference = reference_call()
+                    agreement = _agreement(fitted, reference, args.atol, args.rtol)  # type: ignore[arg-type]
+                except MemoryError as error:
                     baseline = None
-                reference = reference_call()
-                agreement = _agreement(fitted, reference, args.atol, args.rtol)  # type: ignore[arg-type]
+                    agreement = {"available": False, "reason": str(error)}
             else:
                 baseline = None
                 agreement = {
