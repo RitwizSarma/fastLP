@@ -167,8 +167,8 @@ class Residualizer:
         return error
 
 
-def factorize_effects(frame, columns: tuple[str, ...]) -> tuple[np.ndarray, np.ndarray]:
-    """Return dense categorical codes and group counts for each FE column."""
+def factorize_effects(frame, columns: tuple[str | tuple[str, ...], ...]) -> tuple[np.ndarray, np.ndarray]:
+    """Return dense codes for each simple or joint-key FE partition."""
     if not columns:
         return np.empty((len(frame), 0), dtype=np.int64), np.empty(0, dtype=np.int64)
 
@@ -179,11 +179,14 @@ def factorize_effects(frame, columns: tuple[str, ...]) -> tuple[np.ndarray, np.n
     codes = np.empty((len(frame), len(columns)), dtype=np.int64)
     counts = np.empty(len(columns), dtype=np.int64)
     for index, column in enumerate(columns):
+        keys = (column,) if isinstance(column, str) else column
         if factorize is None:
-            encoded, categories = __import__("pandas").factorize(frame[column], sort=True)
+            pandas = __import__("pandas")
+            labels = frame[keys[0]] if len(keys) == 1 else pandas.MultiIndex.from_frame(frame[list(keys)])
+            encoded, categories = pandas.factorize(labels, sort=True)
             n_groups = len(categories)
         else:
-            encoded, n_groups = factorize((column,))
+            encoded, n_groups = factorize(keys)
         if (encoded < 0).any():
             raise ValueError(f"fixed-effect column {column!r} contains missing values")
         codes[:, index] = encoded

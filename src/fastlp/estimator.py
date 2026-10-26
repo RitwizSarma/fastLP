@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from math import isfinite
 from numbers import Integral, Real
 from typing import Any
@@ -26,6 +26,8 @@ from ._degrees_of_freedom import cluster_parameter_count, effect_rank
 from ._frame import PanelFrame, prepare_panel
 from ._linalg import RegressionDesign
 from ._memory import input_size, plan_memory
+from ._progress import ProgressEvent, ProgressReporter
+from . import sugar
 
 
 def _as_columns(value: str | Sequence[str] | None, name: str) -> tuple[str, ...]:
@@ -37,6 +39,83 @@ def _as_columns(value: str | Sequence[str] | None, name: str) -> tuple[str, ...]
     if not all(isinstance(column, str) for column in columns):
         raise ValueError(f"{name} must contain only column names")
     return columns
+
+
+def _as_terms(value, name: str) -> tuple[str | sugar.Interaction, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, (str, sugar.Interaction)):
+        terms = (value,)
+    else:
+        terms = tuple(value)
+    if not all(isinstance(term, (str, sugar.Interaction)) for term in terms):
+        raise ValueError(f"{name} must contain column names or sugar.interact terms")
+    return terms
+
+
+def _as_effects(value) -> tuple[str | tuple[str, ...], ...]:
+    if value is None:
+        return ()
+    if isinstance(value, (str, sugar.FixedEffect)):
+        value = (value,)
+    effects = tuple(
+        term.columns if isinstance(term, sugar.FixedEffect) else term for term in value
+    )
+    if not all(
+        isinstance(term, str)
+        or (isinstance(term, tuple) and term and all(isinstance(key, str) for key in term))
+        for term in effects
+    ):
+        raise ValueError("fixed_effects must contain column names or sugar.fe terms")
+    return effects
+
+
+def _lagged_shock_requests(value, families: tuple[sugar.ShockFamily, ...]):
+    if not isinstance(value, Mapping):
+        return _lag_requests(value, tuple(basis for family in families for basis in family.basis), "shock_lags")
+    known = {family.name for family in families}
+    unknown = sorted(set(value).difference(known))
+    if unknown:
+        raise ValueError(f"shock_lags contains unknown shock families: {unknown}")
+    return tuple(
+        (basis, lag)
+        for family in families
+        for lag in _as_lag_numbers(value.get(family.name, ()), f"shock_lags[{family.name!r}]")
+        for basis in family.basis
+    )
+
+
+def _lagged_control_requests(
+    value, terms: tuple[str | sugar.Interaction, ...],
+    generated: Mapping[str, sugar.GeneratedTerm],
+):
+    products = {
+        tuple(sorted(term.factors)): name
+        for name, term in generated.items()
+        if term.category is None
+    }
+    names = tuple(
+        term if isinstance(term, str) else products.get(
+            tuple(sorted(term.factors)), ":".join(term.factors)
+        )
+        for term in terms
+    )
+    if not isinstance(value, Mapping):
+        return _lag_requests(value, names, "control_lags")
+    aliases = {}
+    for term, name in zip(terms, names, strict=True):
+        key = term if isinstance(term, str) else term.name or ":".join(term.factors)
+        if key in aliases:
+            raise ValueError(f"ambiguous control_lags key {key!r}; give controls unique names")
+        aliases[key] = name
+    unknown = sorted(set(value).difference(aliases))
+    if unknown:
+        raise ValueError(f"control_lags contains unknown controls: {unknown}")
+    return tuple(
+        (name, lag)
+        for key, name in aliases.items()
+        for lag in _as_lag_numbers(value.get(key, ()), f"control_lags[{key!r}]")
+    )
 
 
 def _with_column_names(data: Any, column_names: Sequence[str] | None) -> Any:
@@ -453,15 +532,17 @@ class LocalProjection:
         *,
         column_names: Sequence[str] | None = None,
         outcome: str,
-        shock: str | Sequence[str],
-        controls: Sequence[str] = (),
+        shock: str | sugar.Interaction | Sequence[str | sugar.Interaction],
+        controls: Sequence[str | sugar.Interaction] = (),
         outcome_lags: int | Sequence[int] = 0,
         shock_lags: int | Sequence[int] | Mapping[str, int | Sequence[int]] = 0,
         control_lags: int | Sequence[int] | Mapping[str, int | Sequence[int]] = 0,
         unit: str,
         time: str,
-        fixed_effects: Sequence[str] = (),
+        fixed_effects: Sequence[str | sugar.FixedEffect] = (),
         cluster: ClusterTerm | Sequence[ClusterTerm] | None = None,
+        progress: bool = False,
+        progress_callback: Callable[[ProgressEvent], None] | None = None,
     ) -> "LocalProjection":
         """Fit local projections.
 
@@ -484,12 +565,30 @@ class LocalProjection:
         It is not a process-RSS limit: caller input, Python/allocator overhead
         and private library workspaces are excluded.
         """
+        if not isinstance(progress, bool):
+            raise ValueError("progress must be a boolean")
+        if progress_callback is not None and not callable(progress_callback):
+            raise ValueError("progress_callback must be callable or None")
+        with ProgressReporter(progress, progress_callback) as reporter:
+            return self._fit_impl(
+                data, column_names=column_names, outcome=outcome, shock=shock,
+                controls=controls, outcome_lags=outcome_lags, shock_lags=shock_lags,
+                control_lags=control_lags, unit=unit, time=time,
+                fixed_effects=fixed_effects, cluster=cluster, reporter=reporter,
+            )
+
+    def _fit_impl(
+        self, data, *, column_names, outcome, shock, controls, outcome_lags,
+        shock_lags, control_lags, unit, time, fixed_effects, cluster, reporter,
+    ) -> "LocalProjection":
+        reporter.update("validate specification")
         data = _with_column_names(data, column_names)
-        shocks = _as_columns(shock, "shock")
-        if not shocks:
+        shock_terms = _as_terms(shock, "shock")
+        if not shock_terms:
             raise ValueError("shock must be a column name or a non-empty sequence of column names")
-        controls = _as_columns(controls, "controls")
-        effects = _as_columns(fixed_effects, "fixed_effects")
+        control_terms = _as_terms(controls, "controls")
+        effects = _as_effects(fixed_effects)
+        has_sugar = any(isinstance(term, sugar.Interaction) for term in (*shock_terms, *control_terms))
         if effects and self.covariance in {"hc2", "hc3"}:
             raise ValueError(
                 "HC2 and HC3 are not supported with fixed effects because exact "
@@ -497,31 +596,72 @@ class LocalProjection:
                 "or covariance='hc1'"
             )
         cluster_terms = _as_cluster_terms(cluster) if cluster is not None else ()
-        required = (outcome, unit, time, *shocks, *controls, *effects)
+        raw_effects = tuple(column for effect in effects for column in ((effect,) if isinstance(effect, str) else effect))
+        source_columns = sugar.dependencies((*shock_terms, *control_terms))
+        required = (outcome, unit, time, *source_columns, *raw_effects)
         if self.covariance == "cluster":
             if not cluster_terms:
                 raise ValueError("cluster must be supplied when covariance='cluster'")
             required = (*required, *(column for term in cluster_terms for column in term))
         elif cluster_terms:
             raise ValueError("cluster is only valid when covariance='cluster'")
-        if len(set((*shocks, *controls))) != len((*shocks, *controls)):
+        plain_names = tuple(term for term in (*shock_terms, *control_terms) if isinstance(term, str))
+        if len(set(plain_names)) != len(plain_names):
             raise ValueError("shock and controls must not contain duplicate columns")
-
-        lag_requests = (
-            *_lag_requests(outcome_lags, (outcome,), "outcome_lags"),
-            *_lag_requests(shock_lags, shocks, "shock_lags"),
-            *_lag_requests(control_lags, controls, "control_lags"),
+        # Preserve fail-fast lag validation even when generated terms need the
+        # prepared frame to determine their categorical basis size.
+        _as_lag_numbers(outcome_lags, "outcome_lags")
+        for label, setting in (("shock_lags", shock_lags), ("control_lags", control_lags)):
+            if isinstance(setting, Mapping):
+                for key, value in setting.items():
+                    _as_lag_numbers(value, f"{label}[{key!r}]")
+            else:
+                _as_lag_numbers(setting, label)
+        numeric_sources = tuple(
+            column for term in (*shock_terms, *control_terms)
+            for column in ((term,) if isinstance(term, str) else (
+                *term.factors,
+                *((term.by,) if isinstance(term.by, str) else ()),
+            ))
         )
-
-        numeric_columns = (outcome, *shocks, *controls)
+        numeric_columns = (outcome, *dict.fromkeys(numeric_sources))
         memory_plan = None
         planned_batch = _HORIZON_BATCH_SIZE
         if self.memory_budget is not None:
+            if not has_sugar:
+                old_lags = (
+                    *_lag_requests(outcome_lags, (outcome,), "outcome_lags"),
+                    *_lag_requests(shock_lags, shock_terms, "shock_lags"),
+                    *_lag_requests(control_lags, control_terms, "control_lags"),
+                )
+                estimated_lags = len(set(old_lags))
+                estimated_features = len(shock_terms) + len(control_terms)
+            else:
+                estimated_bases = 0
+                for term in shock_terms:
+                    if isinstance(term, sugar.Interaction) and isinstance(term.by, sugar.Category):
+                        estimated_bases += len(term.by.levels) if term.by.levels is not None else 32
+                    elif isinstance(term, sugar.Interaction) and isinstance(term.by, str):
+                        estimated_bases += 2
+                    else:
+                        estimated_bases += 1
+                max_shock_lags = (
+                    sum(len(_as_lag_numbers(item, "shock_lags")) for item in shock_lags.values()) * estimated_bases
+                    if isinstance(shock_lags, Mapping)
+                    else len(_as_lag_numbers(shock_lags, "shock_lags")) * estimated_bases
+                )
+                max_control_lags = (
+                    sum(len(_as_lag_numbers(item, "control_lags")) for item in control_lags.values())
+                    if isinstance(control_lags, Mapping)
+                    else len(_as_lag_numbers(control_lags, "control_lags")) * len(control_terms)
+                )
+                estimated_lags = len(_as_lag_numbers(outcome_lags, "outcome_lags")) + max_shock_lags + max_control_lags
+                estimated_features = sugar.upper_bound_features(shock_terms, control_terms)
             rows, frame_bytes = input_size(data, required)
             memory_plan = plan_memory(
                 budget=self.memory_budget, rows=rows, frame_bytes=frame_bytes,
-                features=len(shocks) + len(controls) + len(set(lag_requests)) + int(not effects),
-                horizons=self.horizons, lag_features=len(set(lag_requests)),
+                features=estimated_features + estimated_lags + int(not effects),
+                horizons=self.horizons, lag_features=estimated_lags,
                 effects=len(effects), cluster_terms=len(cluster_terms),
                 retain_residuals=self.retain_residuals, covariance=self.covariance,
                 kernel=self.hac_kernel, exact_rank=self.fe_dof == "exact",
@@ -530,12 +670,33 @@ class LocalProjection:
             planned_batch = memory_plan.batch_size(
                 min(_HORIZON_BATCH_SIZE, self.horizons + 1)
             )
+        reporter.update("prepare panel")
         frame, input_was_sorted = prepare_panel(data, required, numeric_columns)
+        reporter.update("generate terms and lags")
+        if has_sugar:
+            feature_terms, generated, families, auto_nuisance = sugar.compile_terms(
+                frame, shock_terms, control_terms
+            )
+        else:
+            feature_terms = tuple((*shock_terms, *control_terms))
+            generated = {}
+            families = tuple(sugar.ShockFamily(term, "plain", (term,)) for term in shock_terms)
+            auto_nuisance = frozenset()
+        lag_requests = (
+            *_lag_requests(outcome_lags, (outcome,), "outcome_lags"),
+            *_lagged_shock_requests(shock_lags, families),
+            *_lagged_control_requests(control_lags, control_terms, generated),
+        )
+        lag_sources = {source for source, _ in lag_requests}
+        frame = sugar.materialize_terms(
+            frame, {name: term for name, term in generated.items() if name in lag_sources}
+        )
         frame, lag_feature_names, valid_lag_rows, lag_path = _add_lags(
             frame, unit, time, lag_requests
         )
         if not len(frame):
             raise ValueError("data must contain at least one panel unit")
+        reporter.update("align outcomes and select samples")
         future_positions, lead_path = self._lead_positions(frame, unit=unit, time=time)
         future_valid = future_positions >= 0
         if self.response == "cumulative":
@@ -558,9 +719,10 @@ class LocalProjection:
                     pruned_by_key[key] = result
                 masks[:, horizon], singleton_dropped[horizon], singleton_rounds[horizon] = result
 
-        base_features = (*shocks, *controls, *lag_feature_names)
-        base_x = frame.matrix(base_features, dtype=np.float64)
-        if not effects:
+        base_features = (*feature_terms, *lag_feature_names)
+        deferred_x = has_sugar and self.sample == "common"
+        base_x = None if deferred_x else sugar.design_matrix(frame, base_features, generated)
+        if base_x is not None and not effects:
             base_x = np.column_stack((np.ones(len(frame), dtype=np.float64), base_x))
         feature_names = ("Intercept", *base_features) if not effects else base_features
         outcome_values = frame.column(outcome).astype(np.float64, copy=False)
@@ -574,11 +736,18 @@ class LocalProjection:
                 group_masks.append(mask)
             groups[key].append(horizon)
 
-        n_features = base_x.shape[1]
+        shock_support: dict[str, dict[object, dict[int, dict[str, int]]]] = {
+            family.name: {level: {} for level in family.levels}
+            for family in families if family.kind == "categorical"
+        }
+
+        candidate_features = len(feature_names)
         n_horizons = self.horizons + 1
-        coefficients = np.empty((n_horizons, n_features), dtype=np.float64)
+        coefficients = np.full((n_horizons, candidate_features), np.nan)
         standard_errors = np.empty_like(coefficients)
-        covariances = np.empty((n_horizons, n_features, n_features), dtype=np.float64)
+        covariances = np.empty((n_horizons, candidate_features, candidate_features), dtype=np.float64)
+        retained_columns: np.ndarray | None = None
+        absorbed_terms: list[dict[str, object]] = []
         residuals_by_horizon: list[np.ndarray | None] | None = (
             [None] * n_horizons if self.retain_residuals else None
         )
@@ -598,16 +767,111 @@ class LocalProjection:
         warned_cluster_terms: set[str] = set()
 
         for group_id, (mask, horizons) in enumerate(zip(group_masks, groups.values(), strict=True)):
+            reporter.update(
+                "factorize fixed effects",
+                completed=group_id,
+                total=len(group_masks),
+                message=f"horizons {horizons[0]}..{horizons[-1]}",
+            )
             if not mask.any():
                 raise ValueError(f"no valid observations at horizon {horizons[0]}")
             positions = np.flatnonzero(mask)
             anchor = frame.take(positions)
-            x = base_x[mask]
+            if base_x is None:
+                x = sugar.design_matrix(anchor, base_features, generated)
+                if not effects:
+                    x = np.column_stack((np.ones(len(anchor), dtype=np.float64), x))
+            else:
+                x = base_x[mask]
+            if shock_support:
+                feature_positions = {name: index for index, name in enumerate(feature_names)}
+                for family in families:
+                    if family.kind != "categorical":
+                        continue
+                    category_codes = pd.Categorical(
+                        anchor.column(family.moderator), categories=family.levels
+                    ).codes
+                    level_counts = np.bincount(
+                        category_codes, minlength=len(family.levels)
+                    )
+                    for index, (level, basis) in enumerate(
+                        zip(family.levels, family.basis, strict=True)
+                    ):
+                        counts = {
+                            "n_obs": int(level_counts[index]),
+                            "nonzero_shock_n_obs": int(np.count_nonzero(
+                                x[:, feature_positions[basis]]
+                            )),
+                        }
+                        for horizon in horizons:
+                            shock_support[family.name][level][horizon] = counts
             effect_codes, effect_counts = factorize_effects(anchor, effects)
-            # Rank depends on the final retained sample, but not on residualized
-            # values. Resolve it before potentially expensive FE absorption so
-            # an over-budget exact multiway calculation fails immediately.
+            # FE rank can be checked before absorption; full model rank must
+            # wait until generated absorbed nuisance terms have been removed.
             absorbed = effect_rank(effect_codes, effect_counts, mode=self.fe_dof)
+            reporter.update("absorb regressors", message=f"{x.shape[1]} columns")
+            exact_x = _exact_panel_demean(x, anchor, effects, unit=unit, time=time)
+            if exact_x is None:
+                residualizer = Residualizer(effect_codes, effect_counts)
+                x_tilde, x_diag = residualizer.transform(
+                    x,
+                    tol=self.demean_tol,
+                    max_iter=self.max_iter,
+                    acceleration=self.demean_acceleration,
+                )
+            else:
+                residualizer = None
+                x_tilde, x_diag = exact_x
+            column_scales = np.linalg.norm(x_tilde, axis=0)
+            centered_x = x - x.mean(axis=0)
+            input_scales = np.max(np.abs(centered_x), axis=0)
+            safe_input_scales = np.where(input_scales == 0.0, 1.0, input_scales)
+            normalized_within_norms = np.linalg.norm(
+                x_tilde / safe_input_scales, axis=0
+            )
+            within_signal_floor = _within_signal_floor(
+                len(anchor),
+                effect_codes,
+                effect_counts,
+                iterative=residualizer is not None and bool(effects),
+                tolerance=self.demean_tol,
+            )
+            weak_columns = (
+                (~np.isfinite(column_scales))
+                | (~np.isfinite(normalized_within_norms))
+                | (column_scales == 0.0)
+                | (normalized_within_norms <= within_signal_floor)
+            )
+            requested_weak = [
+                feature_names[index] for index in np.flatnonzero(weak_columns)
+                if feature_names[index] not in auto_nuisance
+            ]
+            if requested_weak:
+                raise ValueError(
+                    f"residualized design has zero or negligible within variation at "
+                    f"horizon {horizons[0]} for columns {requested_weak}"
+                )
+            kept = np.flatnonzero(~weak_columns)
+            if retained_columns is None:
+                retained_columns = kept
+            elif not np.array_equal(retained_columns, kept):
+                raise ValueError(
+                    "generated lower-order terms are absorbed differently across "
+                    "horizons; use a common sample or revise the specification"
+                )
+            for index in np.flatnonzero(weak_columns):
+                absorbed_terms.append({
+                    "term": feature_names[index], "horizons": tuple(horizons),
+                    "reason": "absorbed by fixed effects or zero within variation",
+                })
+            x_tilde = x_tilde[:, kept]
+            column_scales = column_scales[kept]
+            normalized_within_norms = normalized_within_norms[kept]
+            x_diag = DemeanDiagnostics(
+                x_diag.iterations[kept], x_diag.backend, x_diag.method,
+                x_diag.acceleration_accepted[kept],
+            )
+            n_features = len(kept)
             model_rank = n_features + absorbed.rank
             if len(anchor) <= model_rank:
                 qualification = "" if absorbed.exact else " under the conservative rank bound"
@@ -652,7 +916,7 @@ class LocalProjection:
                                 "cluster-robust inference may be unreliable, and CR1 does "
                                 "not eliminate the few-cluster problem",
                                 FewClustersWarning,
-                                stacklevel=2,
+                                stacklevel=3,
                             )
                             warned_cluster_terms.add(label)
 
@@ -674,45 +938,7 @@ class LocalProjection:
                 }
             )
 
-            exact_x = _exact_panel_demean(x, anchor, effects, unit=unit, time=time)
-            if exact_x is None:
-                residualizer = Residualizer(effect_codes, effect_counts)
-                x_tilde, x_diag = residualizer.transform(
-                    x,
-                    tol=self.demean_tol,
-                    max_iter=self.max_iter,
-                    acceleration=self.demean_acceleration,
-                )
-            else:
-                residualizer = None
-                x_tilde, x_diag = exact_x
-            column_scales = np.linalg.norm(x_tilde, axis=0)
-            centered_x = x - x.mean(axis=0)
-            input_scales = np.max(np.abs(centered_x), axis=0)
-            safe_input_scales = np.where(input_scales == 0.0, 1.0, input_scales)
-            normalized_within_norms = np.linalg.norm(
-                x_tilde / safe_input_scales, axis=0
-            )
-            within_signal_floor = _within_signal_floor(
-                len(anchor),
-                effect_codes,
-                effect_counts,
-                iterative=residualizer is not None and bool(effects),
-                tolerance=self.demean_tol,
-            )
-            weak_columns = (
-                (~np.isfinite(column_scales))
-                | (~np.isfinite(normalized_within_norms))
-                | (column_scales == 0.0)
-                | (normalized_within_norms <= within_signal_floor)
-            )
-            if weak_columns.any():
-                names = [feature_names[index] for index in np.flatnonzero(weak_columns)]
-                raise ValueError(
-                    f"residualized design has zero or negligible within variation at "
-                    f"horizon {horizons[0]} for columns {names}"
-                )
-
+            reporter.update("prepare solver", message=f"{n_features} retained columns")
             design = RegressionDesign(x_tilde, horizon=horizons[0], column_scales=column_scales)
             design.diagnostics["normalized_within_norms"] = normalized_within_norms.copy()
             design.diagnostics["within_signal_floor"] = within_signal_floor
@@ -727,6 +953,12 @@ class LocalProjection:
             next_step = 0
             for batch_start in range(0, len(horizons), batch_size):
                 batch_horizons = horizons[batch_start : batch_start + batch_size]
+                reporter.update(
+                    "estimate horizon batch",
+                    completed=batch_start,
+                    total=len(horizons),
+                    message=f"horizons {batch_horizons[0]}..{batch_horizons[-1]}",
+                )
                 if self.response == "level":
                     y = np.column_stack(
                         [outcome_values[future_positions[mask, horizon]] for horizon in batch_horizons]
@@ -753,6 +985,7 @@ class LocalProjection:
                 coef, residuals = design.solve(y_tilde)
                 _require_finite(coef, "coefficients")
                 _require_finite(residuals, "residuals")
+                reporter.update("calculate covariance", message=f"horizons {batch_horizons[0]}..{batch_horizons[-1]}")
                 if self.covariance == "homoskedastic":
                     covariance = homoskedastic(x_tilde, residuals, bread, model_rank=model_rank)
                     covariance_diagnostics = tuple(
@@ -841,9 +1074,10 @@ class LocalProjection:
                 stderr = np.sqrt(diagonal)
                 _require_finite(covariance, "covariance in original units")
                 _require_finite(stderr, "standard errors")
-                coefficients[batch_horizons] = coef.T
-                standard_errors[batch_horizons] = stderr
-                covariances[batch_horizons] = covariance
+                coefficients[np.ix_(batch_horizons, kept)] = coef.T
+                standard_errors[np.ix_(batch_horizons, kept)] = stderr
+                for column, horizon in enumerate(batch_horizons):
+                    covariances[horizon][np.ix_(kept, kept)] = covariance[column]
                 for column, horizon in enumerate(batch_horizons):
                     if residuals_by_horizon is not None:
                         residuals_by_horizon[horizon] = residuals[:, column].copy()
@@ -851,11 +1085,22 @@ class LocalProjection:
                     y_acceleration_accepted[horizon] = y_diag.acceleration_accepted[column]
                     cache_group_by_horizon[horizon] = group_id
                     covariance_diagnostics_by_horizon[horizon] = covariance_diagnostics[column]
+                reporter.update(
+                    "estimate horizon batch",
+                    completed=batch_start + len(batch_horizons),
+                    total=len(horizons),
+                )
             x_iterations_by_group.append(x_diag.iterations)
             acceleration_accepted_by_group.append(x_diag.acceleration_accepted)
             backends.append(x_diag.backend)
             methods.append(x_diag.method)
 
+        assert retained_columns is not None
+        coefficients = coefficients[:, retained_columns]
+        standard_errors = standard_errors[:, retained_columns]
+        covariances = covariances[:, retained_columns][:, :, retained_columns]
+        feature_names = tuple(feature_names[index] for index in retained_columns)
+        reporter.update("assemble results")
         tail_probability = self.alpha / 2
         critical_values = np.full(n_horizons, normal_dist.isf(tail_probability))
         finite_df = np.isfinite(inference_df)
@@ -875,7 +1120,10 @@ class LocalProjection:
         self.conf_int_ = confidence_intervals
         self.horizons_ = np.arange(n_horizons)
         self.feature_names_in_ = np.asarray(feature_names, dtype=object)
-        self.shock_names_in_ = np.asarray(shocks, dtype=object)
+        self.shock_names_in_ = np.asarray([family.name for family in families], dtype=object)
+        self.shock_families_ = families
+        self.shock_support_ = shock_support
+        self.absorbed_terms_ = tuple(absorbed_terms)
         self.sample_ = self.sample
         self.response_ = self.response
         self.n_obs_by_horizon_ = masks.sum(axis=0, dtype=int)
@@ -957,6 +1205,87 @@ class LocalProjection:
         from .plotting import plot_irf
 
         return plot_irf(self, coefficient=coefficient, **kwargs)
+
+    def irf_frame(
+        self,
+        shock: str | None = None,
+        *,
+        at: Sequence[float] | None = None,
+        levels: Sequence[object] | None = None,
+    ) -> pd.DataFrame:
+        """Return fitted shock-response paths, including moderated contrasts."""
+        self._require_fitted()
+        if shock is None:
+            shock = self.shock_families_[0].name
+        family = next((item for item in self.shock_families_ if item.name == shock), None)
+        if family is None:
+            raise ValueError(
+                f"shock {shock!r} is not fitted; choose one of "
+                f"{[item.name for item in self.shock_families_]}"
+            )
+        if family.kind == "continuous":
+            if at is None or len(at) == 0:
+                raise ValueError("continuous moderated shocks require at=[...] values")
+            values = tuple(float(value) for value in at)
+            if not np.isfinite(values).all():
+                raise ValueError("at values must be finite")
+            if levels is not None:
+                raise ValueError("levels is only valid for categorical shocks")
+        else:
+            if at is not None:
+                raise ValueError("at is only valid for continuous moderated shocks")
+            values = family.levels if family.kind == "categorical" else (None,)
+            if levels is not None:
+                if family.kind != "categorical":
+                    raise ValueError("levels is only valid for categorical shocks")
+                unknown = set(levels).difference(family.levels)
+                if unknown:
+                    raise ValueError(f"unknown shock levels: {sorted(unknown)}")
+                values = tuple(level for level in values if level in levels)
+                if not values:
+                    raise ValueError("levels must select at least one fitted category")
+        names = list(self.feature_names_in_)
+        records = []
+        for value in values:
+            contrast = np.zeros(len(names), dtype=np.float64)
+            if family.kind == "continuous":
+                contrast[names.index(family.basis[0])] = 1.0
+                contrast[names.index(family.basis[1])] = value
+            elif family.kind == "categorical":
+                contrast[names.index(family.basis[family.levels.index(value)])] = 1.0
+            else:
+                contrast[names.index(family.basis[0])] = 1.0
+            estimates = self.coef_ @ contrast
+            variances = np.einsum("i,hij,j->h", contrast, self.covariance_, contrast)
+            roundoff = (
+                100 * np.finfo(np.float64).eps
+                * np.max(np.abs(self.covariance_), axis=(1, 2))
+                * np.sum(np.abs(contrast)) ** 2
+            )
+            if (variances < -roundoff).any():
+                raise ValueError("shock contrast has a materially negative variance")
+            standard_errors = np.sqrt(np.maximum(variances, 0.0))
+            for index, horizon in enumerate(self.horizons_):
+                half_width = self.critical_values_[index] * standard_errors[index]
+                records.append({
+                    "horizon": int(horizon), "shock": family.name,
+                    "level": value if family.kind == "categorical" else None,
+                    "at": value if family.kind == "continuous" else None,
+                    "n_obs": int(self.n_obs_by_horizon_[index]),
+                    "level_n_obs": (
+                        self.shock_support_[family.name][value][int(horizon)]["n_obs"]
+                        if family.kind == "categorical" else None
+                    ),
+                    "nonzero_shock_n_obs": (
+                        self.shock_support_[family.name][value][int(horizon)]["nonzero_shock_n_obs"]
+                        if family.kind == "categorical" else None
+                    ),
+                    "estimate": estimates[index],
+                    "std_error": standard_errors[index],
+                    "ci_low": estimates[index] - half_width,
+                    "ci_high": estimates[index] + half_width,
+                })
+        return pd.DataFrame.from_records(records)
 
     @property
     def irfplot(self):

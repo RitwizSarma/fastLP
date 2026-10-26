@@ -1,5 +1,212 @@
 # fastLP Next Steps
 
+## Priority plan: `sugar` terms and fit progress
+
+**Status:** implemented in the current working tree; the specification and
+acceptance criteria below remain the reference for follow-up work. This
+feature must work for arbitrary panel data and specifications. The
+flood-adaptation example motivates the API but must not be hard-coded into
+term expansion, identification checks, or plotting. Preserve the existing
+string-based API and numerical results when the new features are unused.
+
+### Public API and meaning
+
+Put the immutable term specifications and helpers in `src/fastlp/sugar.py`.
+Expose the module from `fastlp` so one import statement is sufficient:
+
+```python
+from fastlp import LocalProjection, sugar as s
+
+lp = LocalProjection(horizons=24, covariance="cluster")
+lp.fit(
+    data,
+    outcome="y",
+    shock=s.interact(
+        "event", "treated",
+        by=s.C("prior_exposure_group", levels=["0", "1", "2", "3+"]),
+        name="event_by_experience",
+    ),
+    controls=[s.interact("x1", "x2", "x3", "x4", "x5")],
+    shock_lags=6,
+    unit="unit_id",
+    time="period",
+    fixed_effects=[s.fe("location", "period", "product"), "firm_fe"],
+    cluster="location",
+    progress=True,
+)
+lp.plot_irf("event_by_experience")
+```
+
+- `s.interact(*columns, name=None)` represents their numeric product and
+  accepts any nonempty set of distinct factors; a one-factor form is useful
+  with `by`. Validate the expanded feature count and memory requirement rather
+  than impose an arbitrary interaction-order limit. An ordinary control
+  interaction requests its product only, so a five-way control does not
+  silently generate all 31 nonempty subsets. A shock interaction needs its
+  identifiable lower-order terms as nuisance regressors; generate and dedupe
+  those automatically. Document this context-dependent expansion clearly.
+- `s.C(column, levels=None)` marks a categorical moderator. `levels` fixes
+  category order and plot labels; validate missing, duplicate, and unobserved
+  levels. `by=s.C(...)` makes one shock basis column and one IRF per category.
+  Keep every category-specific shock coefficient, rather than choosing a
+  reference category for the focal shock. Reference-code categorical nuisance
+  terms to avoid a dummy trap. Guard against accidental very-high-cardinality
+  expansions with a clear error and advice to group levels explicitly.
+- `by="numeric_column"` specifies a continuous linear moderator. Include the
+  unmoderated shock and its interaction with the moderator. Compute responses
+  at explicitly requested values, for example
+  `lp.plot_irf("named_shock", at=[0, 1, 3])`. This estimates a shared linear
+  slope, unlike `by=s.C(...)`, which estimates separate level responses.
+- `s.fe(*columns)` denotes **one** fixed-effect partition formed from the
+  joint keys, including three-, four-, and five-way keys. It is not a numeric
+  product. Existing fixed-effect strings remain valid, and users with
+  precomputed integer FE IDs may continue passing those strings for speed.
+- Keep `shock` as a string, term, or sequence of either; allow strings and
+  terms together in `controls` and `fixed_effects`. Give generated columns
+  deterministic, collision-checked names. A `name` labels a shock family for
+  plotting; it does not replace unique internal coefficient names. Scalar
+  `shock_lags` applies to every shock basis. In a lag mapping, a named shock
+  family's key applies the same lags to all its bases; a named control term's
+  key similarly identifies its completed product. Reject ambiguous or unknown
+  keys. `shock_lags` must shift each **completed** shock basis column, so the
+  lagged interaction and moderator refer to their values at the lagged date.
+
+For a categorical moderator with shock factors `A` and `B` and categories
+`D_k`, the focal columns are `A * B * D_k` for every `k`. Add the proper
+lower-order terms needed to compare these paths, including category-specific
+`A` and `B` effects where identifiable. Do not add a redundant unsplit
+`A * B` alongside every `A * B * D_k`. For a continuous moderator `Z`, the
+plotted response at `z` is the base-shock coefficient plus `z` times the
+moderation coefficient; use the full horizon-specific covariance matrix for
+its standard error and confidence interval. Do not interpret the interaction
+coefficient alone as the response at `z`.
+
+### Identification and fixed-effect absorption
+
+Handle absorption from the *actual retained sample at each horizon*, without
+special cases for particular column names or FE combinations:
+
+1. Generate candidate shock, explicit-control, and automatically required
+   lower-order columns. Track each column's source and whether it is a focal
+   shock, an explicit user control, or generated nuisance term.
+2. Apply the existing FE within transform and numerical within-signal check to
+   candidate columns. Omit an absorbed **generated nuisance** term and record
+   its name, reason, and affected horizon group. An absorbed requested shock
+   basis column must raise an actionable identification error; never draw an
+   IRF for it. Preserve the current error behavior for an absorbed explicit
+   control. Deduplicate structurally identical generated terms first.
+3. Calculate model rank, residual degrees of freedom, and clustered correction
+   rank using the columns actually retained. The current `fit()` calculates
+   these before demeaning, so its ordering must change. FE rank itself can be
+   prepared earlier. Keep the numerical rank-deficiency check for dependencies
+   that FE absorption alone does not explain; do not silently choose a
+   different estimand by dropping an arbitrary jointly collinear regressor.
+4. Keep a consistent coefficient layout across horizon cache groups. If a
+   requested level is unsupported at any horizon, or generated-nuisance
+   absorption differs across groups in a way that changes the model, report
+   the affected horizons and terms. Do not silently change the model between
+   horizons. Check category support after lag, lead, and singleton filtering.
+
+Use reference coding for categorical nuisance terms and report level-specific
+sample/support counts. Do not infer support from the unfiltered input. Preserve
+the exact one-/two-way unit/time FE shortcut only when the normalized FE terms
+really are the plain unit/time columns; grouped `s.fe(...)` terms use the
+general factorization path.
+
+### Performance and memory requirements
+
+The syntax must not impose a performance penalty on fits that use only strings
+and leave progress disabled. Resolve term specifications once, before the
+existing preparation/lag/design path, and keep the parsed specification small.
+
+- Expand source-column names and the **maximum** generated feature count
+  before calling the existing memory planner. Include shock bases, requested
+  lags, categorical nuisance columns, covariance/result matrices, and grouped
+  FE workspaces. The budget must fail before expensive materialization when
+  the planned minimum is too large. Preserve the planner's conservative
+  estimator-owned-memory semantics.
+- Select only needed source columns from pandas/Polars inputs. Keep Polars
+  native; do not convert the entire input to pandas. Generate lagged shock
+  basis columns on the full prepared panel because exact calendar lags need
+  past rows. Generate nonlagged products on retained rows where practical.
+  Avoid constructing a dense all-category indicator matrix or making repeated
+  full-frame copies merely to name terms.
+- Factorize joint FE keys directly with `PanelFrame.factorize(tuple_of_keys)`;
+  both frame adapters already support this. Adapt `factorize_effects()` to
+  pass each `s.fe(...)` key tuple as one FE dimension. Reuse FE codes and one
+  residualizer across all RHS columns and horizon outcomes within a cache
+  group. Do not split the native RHS transform into tiny calls for progress:
+  the Rust path parallelizes across columns.
+- Preserve horizon-mask grouping, the cached residualized design, and bounded
+  outcome batches. Compute all paths from one fitted covariance matrix per
+  horizon. Do not refit the LP once per category or requested `at` value.
+  Do not shrink the numerical batch size merely to refresh progress.
+- Benchmark time by preparation, term generation, FE encoding, RHS absorption,
+  solve, and covariance. Record peak RSS and numerical equivalence to a
+  manually constructed design on representative synthetic panels. Test both
+  categorical and continuous moderation and the no-sugar/no-progress path.
+
+The column count is a real cost, not a parser cost: `K` categorical levels
+with `L` shock lags create `K * (L + 1)` focal/lag columns before nuisance
+terms. Each `float64` design column costs 8 bytes per retained row per copy;
+matrix work and covariance also grow with feature count. Offer level-count
+validation and diagnostics rather than claiming large interactions are free.
+
+### Progress reporting
+
+Add `progress: bool = False` and an optional
+`progress_callback: Callable[[ProgressEvent], None] | None = None` to `fit()`.
+With `progress=True`, show concise stage names, elapsed time, and genuine
+completed/total counts when available. Use a small internal reporter in
+`src/fastlp/_progress.py`; avoid a mandatory terminal/notebook UI dependency.
+Make `ProgressEvent` an immutable public type with stage, completed, total,
+elapsed seconds, and message fields. Emit callback events on the fitting
+thread at stage/batch boundaries; the built-in renderer alone may use a
+background heartbeat during a long blocking call.
+
+Instrument these stages in the existing code: input read/validation/sort;
+interaction and lag generation; lead alignment and sample selection; FE
+factorization/rank; RHS absorption and identification; solver preparation;
+outcome/solve/covariance horizon batches; and result assembly. Report real
+cache-group, column, or horizon-batch completion at boundaries. Panel sorting,
+some NumPy operations, and the Rust absorption/covariance calls are opaque
+while running: show the active stage plus a throttled elapsed-time heartbeat,
+not an invented percentage. The current Rust calls release the GIL, allowing
+a lightweight heartbeat while they run. Do not add per-row callbacks or locks
+inside numerical loops.
+
+Default-off reporting should amount to inexpensive conditional checks and no
+timer thread. With progress enabled, throttle updates (for example every
+5-10 seconds), use a display that works in terminals and notebooks, and clean
+up the reporter in `try/finally` on success or failure. Do not interleave
+background UI writes with user callbacks; dispatch structured completion
+events on the fitting thread. Progress output must not change the fit result,
+sample, batching, or numerical path.
+
+### Implementation sequence and acceptance checks
+
+1. Add `sugar.py` and export `sugar` in `__init__.py`. Unit-test validation,
+   naming, deduplication, categorical basis construction, continuous bases,
+   and products with one through five factors plus a higher-order case before
+   integrating with `fit()`.
+2. Extend `estimator.py`, `_frame.py`, `_demean.py`, and `_memory.py` in that
+   order: parse raw dependencies; budget the expanded design; generate only
+   needed columns; encode grouped FEs; absorb and classify terms; then compute
+   rank and solve. Keep original plain-string results unchanged.
+3. Store named shock-family metadata. Extend `plotting.py` and add a tidy
+   `irf_frame()` for level/`at` responses, estimates, standard errors, and
+   intervals. Keep `to_frame()` as the coefficient-level table for backward
+   compatibility. Verify categorical direct-coefficient and continuous
+   covariance-based intervals against manual calculations.
+4. Add the progress reporter and fit hooks. Test silent default, ordered
+   stages, truthful counts, throttling, exception cleanup, and unchanged
+   estimates with progress on and off. Test both pandas and Polars inputs.
+5. Document the API in README and quickstart. Add generic small-panel manual
+   equivalence tests for grouped FEs, lags of completed interactions, absorbed
+   lower-order terms, unsupported shock levels, and `sample="per_horizon"`.
+   Run the focused suite, then the existing suite, and benchmark opt-in larger
+   cases without adding brittle wall-clock assertions to unit tests.
+
 ## Basic and obvious features
 
 1. `numpy` arrays as input. Duh.

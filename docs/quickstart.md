@@ -105,6 +105,60 @@ ax.figure.savefig("irf.png", dpi=150, bbox_inches="tight")
 The returned object is a Matplotlib `Axes`, so normal Matplotlib customization
 remains available. Set `show = False` to use the `Axes` object in your own `Figure`. 
 
+## Interactions, grouped responses, and progress
+
+Import the term helpers together with the estimator:
+
+```python
+from fastlp import LocalProjection, sugar as s
+
+lp = LocalProjection(horizons=8, covariance="cluster")
+lp.fit(
+    data,
+    outcome="y",
+    shock=s.interact(
+        "event", "treated",
+        by=s.C("prior_exposure_group", levels=["0", "1", "2+"]),
+        name="event_by_experience",
+    ),
+    controls=[s.interact("income", "urban", "post")],
+    unit="unit", time="time",
+    fixed_effects=[s.fe("region", "time"), "unit"],
+    cluster="unit",
+    progress=True,
+)
+ax = lp.plot_irf("event_by_experience")
+print(lp.irf_frame("event_by_experience"))
+```
+
+`s.fe()` treats its keys as one categorical fixed-effect partition.
+`s.interact()` multiplies numeric columns. A shock interaction includes the
+lower-order terms needed for interpretation; a control interaction adds only
+the specified product. Generated nuisance terms absorbed by fixed effects
+appear in `lp.absorbed_terms_`. A requested shock or control with no within
+variation still raises an error. Keep the grouping variable based on
+information known before the shock if the goal is to compare responses by
+prior experience.
+
+For a continuous moderator, use `by="moderator"` and give the values to plot:
+
+```python
+shock = s.interact("event", "treated", by="prior_count", name="adaptation")
+# After fitting with shock=shock:
+lp.plot_irf("adaptation", at=[0, 1, 3])
+```
+
+The displayed response at each value combines the base and interaction
+coefficients; its interval uses their full covariance. With categorical
+moderation, the plot has one line per category, and `irf_frame()` includes
+counts for each retained category and for nonzero shock observations.
+
+`progress=True` prints stage and elapsed-time updates. For application UIs,
+`progress_callback=callback` receives immutable `ProgressEvent` objects at
+stage and horizon-batch boundaries. Long native operations show an elapsed-time
+heartbeat in the built-in display; the estimator does not change its numerical
+batch size to make the display update more frequently.
+
 ## Choosing inference
 
 Set `covariance` when constructing `LocalProjection`:

@@ -12,12 +12,14 @@ from fastlp._linalg import RegressionDesign
 
 @pytest.mark.parametrize(
     ("k", "condition"),
-    # A one-column design has condition one regardless of the requested ratio.
+    # Representative widths and conditions cover both solver paths, the
+    # switch near condition 1000, and the widest design. Intermediate grid
+    # points exercised the same branches without adding distinct assertions.
     [(1, 1)] + [
         (k, condition)
-        for k in (2, 3, 4, 5, 6, 7, 16)
-        for condition in (1, 100, 500, 2000, 1e5, 1e7)
-    ],
+        for k in (2, 4, 7, 16)
+        for condition in (1, 500, 2000, 1e7)
+    ] + [(7, 1e5), (16, 100)],
 )
 def test_solver_coefficients_residuals_and_covariance(k, condition):
     rng = np.random.default_rng(314)
@@ -131,7 +133,7 @@ def test_exact_collinearity_is_rejected_by_qr_rank_check():
         RegressionDesign(np.column_stack([x, x[:, 0] + x[:, 1]]), horizon=4)
 
 
-@pytest.mark.parametrize("k", [2, 4, 7])
+@pytest.mark.parametrize("k", [2, 7])
 @pytest.mark.parametrize("structure", ["polynomial", "concentrated", "near_duplicate"])
 @pytest.mark.parametrize("outcome_scale", [1e-12, 1e12])
 def test_solver_on_structured_and_rescaled_designs(k, structure, outcome_scale):

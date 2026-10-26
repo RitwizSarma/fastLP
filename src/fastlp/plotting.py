@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
+
+import pandas as pd
 
 if TYPE_CHECKING:
     from matplotlib.axes import Axes
@@ -14,6 +17,8 @@ def plot_irf(
     fitted: "LocalProjection",
     coefficient: str | None = None,
     *,
+    at: Sequence[float] | None = None,
+    levels: Sequence[object] | None = None,
     ax: "Axes | None" = None,
     figsize: tuple[float, float] = (8.0, 4.8),
     title: str | None = None,
@@ -40,7 +45,6 @@ def plot_irf(
 
     if coefficient is None:
         coefficient = str(fitted.shock_names_in_[0])
-    names = [str(name) for name in fitted.feature_names_in_]
     shocks = [str(name) for name in fitted.shock_names_in_]
     if coefficient not in shocks:
         raise ValueError(
@@ -49,11 +53,8 @@ def plot_irf(
     if not isinstance(band_alpha, (int, float)) or not 0 <= band_alpha <= 1:
         raise ValueError("band_alpha must be between zero and one")
 
-    index = names.index(coefficient)
-    horizons = fitted.horizons_
-    estimates = fitted.coef_[:, index]
-    lower = fitted.conf_int_[:, index, 0]
-    upper = fitted.conf_int_[:, index, 1]
+    responses = fitted.irf_frame(coefficient, at=at, levels=levels)
+    paths = list(responses.groupby(["level", "at"], dropna=False, sort=False))
 
     if ax is None:
         _, ax = plt.subplots(figsize=figsize, facecolor="white")
@@ -61,28 +62,31 @@ def plot_irf(
     figure.patch.set_facecolor("white")
     ax.set_facecolor("white")
 
-    ax.fill_between(
-        horizons,
-        lower,
-        upper,
-        color=band_color,
-        alpha=band_alpha,
-        linewidth=0,
-        label=f"{100 * (1 - fitted.alpha):.0f}% confidence interval",
-        zorder=1,
-    )
-    ax.plot(
-        horizons,
-        estimates,
-        color=color,
-        marker=marker,
-        linewidth=linewidth,
-        markersize=markersize,
-        markerfacecolor="white",
-        markeredgewidth=1.5,
-        label=coefficient,
-        zorder=3,
-    )
+    palette = plt.get_cmap("tab10")
+    for index, ((level, at_value), path) in enumerate(paths):
+        level = None if pd.isna(level) else level
+        at_value = None if pd.isna(at_value) else at_value
+        line_color = color if len(paths) == 1 else palette(index % 10)
+        fill_color = band_color if len(paths) == 1 else line_color
+        label = (
+            coefficient if len(paths) == 1 and level is None and at_value is None
+            else f"{level}" if level is not None
+            else f"at {at_value:g}"
+        )
+        ax.fill_between(
+            path["horizon"].to_numpy(), path["ci_low"].to_numpy(),
+            path["ci_high"].to_numpy(), color=fill_color,
+            alpha=band_alpha if len(paths) == 1 else min(band_alpha, 0.18),
+            linewidth=0,
+            label=f"{100 * (1 - fitted.alpha):.0f}% confidence interval" if len(paths) == 1 else None,
+            zorder=1,
+        )
+        ax.plot(
+            path["horizon"].to_numpy(), path["estimate"].to_numpy(),
+            color=line_color, marker=marker, linewidth=linewidth,
+            markersize=markersize, markerfacecolor="white",
+            markeredgewidth=1.5, label=label, zorder=3,
+        )
     if show_zero_line:
         ax.axhline(0.0, color="#64748b", linewidth=1.0, linestyle="--", zorder=2)
 
@@ -90,7 +94,7 @@ def plot_irf(
     ax.set_title(title or f"{response_label} to {coefficient}", loc="left", fontweight="bold")
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel or response_label)
-    ax.set_xticks(horizons)
+    ax.set_xticks(fitted.horizons_)
     ax.grid(axis="y", color="#e2e8f0", linewidth=0.8)
     ax.grid(axis="x", visible=False)
     ax.spines["top"].set_visible(False)

@@ -52,11 +52,7 @@ lp.fit(
 ```
 
 Make sure you explicitly indicate the fixed effects specification. `fastLP`
-does _not_ implicitly use unit- or time-fixed effects. Supply multiple column
-names for additive multi-way fixed effects, for example
-`fixed_effects=["unit", "time"]`. Interacted fixed effects are not currently
-declared through nested tuples; create the interaction as a column first and
-pass that column's name instead.
+does _not_ implicitly use unit- or time-fixed effects, and so you must specify them explicitly. 
 
 Retrieve the results and plot the shock response:
 
@@ -80,7 +76,39 @@ offers a cached default plot through `lp.irfplot`.
 
 </details>
 
-For a more detailed example, check out the [documentation](https://ritwizsarma.github.io/fastLP/quickstart.html).
+
+### Easy syntax for complex specs
+
+For Stata-like ease in building interaction terms, the `sugar` module builds numeric products and grouped shock responses inside `fit()`:
+
+<details>
+<summary>Code</summary>
+
+```python
+from fastlp import LocalProjection, sugar as s
+
+lp = LocalProjection(horizons=12, covariance="cluster")
+lp.fit(
+    data,
+    outcome="y",
+    shock=s.interact(
+        "event", "treated",
+        by=s.C("experience_group", levels=["0", "1", "2+"]),
+        name="event_by_experience",
+    ),
+    controls=[s.interact("income", "urban", "post")],
+    unit="unit", time="time",
+    fixed_effects=[s.fe("region", "time"), "unit"],
+    cluster="unit",
+    progress=True,
+)
+ax = lp.plot_irf("event_by_experience")
+responses = lp.irf_frame("event_by_experience")
+```
+
+</details><br>
+
+For more detailed examples, check out the [documentation](https://ritwizsarma.github.io/fastLP/quickstart.html).
 
 
 <!-- ## Data input flexibility
