@@ -1,6 +1,10 @@
 # fastLP
 
-![fastLP: Panel local projections in Python](fastlp-hero.png)
+<p align="center">
+  <img src="https://raw.githubusercontent.com/RitwizSarma/fastLP/master/fastlp-hero.png"
+       alt="fastLP: Panel local projections in Python"
+       width="800">
+</p>
 
 `fastLP` estimates panel local projections for massive datasets very very
 quickly. Beginner-friendly API, Rust core, and helpful functions for
