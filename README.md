@@ -1,5 +1,7 @@
 # fastLP
 
+![fastLP: Panel local projections in Python](fastlp-hero.png)
+
 `fastLP` estimates panel local projections for massive datasets very very
 quickly. Beginner-friendly API, Rust core, and helpful functions for
 IRF graphs and tables: everything an empirical economist might need.
